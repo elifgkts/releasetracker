@@ -1,4 +1,5 @@
 import re
+import time
 import yaml
 import requests
 import streamlit as st
@@ -15,7 +16,8 @@ HEADERS = {
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
         "Chrome/122.0 Safari/537.36"
-    )
+    ),
+    "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
 }
 
 st.set_page_config(page_title="QA Release Tracker", layout="wide")
@@ -52,13 +54,7 @@ def compute_date_range(mode: str, start: date, end: date, last_n: int, unit: str
     return today - timedelta(days=30), today
 
 
-def is_version_str(s: str) -> bool:
-    s = (s or "").strip()
-    # 9.6.4 / 1.2.3.4 / 12.1
-    return bool(re.fullmatch(r"\d+(?:\.\d+){1,4}", s))
-
-
-def clean_text(x, max_len: int = 700) -> str:
+def clean_text(x, max_len: int = 800) -> str:
     if x is None:
         return ""
     if isinstance(x, list):
@@ -80,31 +76,21 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
     if not s:
         return None
 
-    # TR short words
-    if s in {"bugün"}:
+    if s in {"bugün", "today"}:
         return base
-    if s in {"dün"}:
-        return base - timedelta(days=1)
-
-    # EN short words
-    if s in {"today"}:
-        return base
-    if s in {"yesterday"}:
+    if s in {"dün", "yesterday"}:
         return base - timedelta(days=1)
 
     # TR patterns
     m = re.search(r"(\d+)\s*gün\s*önce", s)
     if m:
         return base - timedelta(days=int(m.group(1)))
-
     m = re.search(r"(\d+)\s*hafta\s*önce", s)
     if m:
         return base - timedelta(weeks=int(m.group(1)))
-
     m = re.search(r"(\d+)\s*ay\s*önce", s)
     if m:
         return base - relativedelta(months=int(m.group(1)))
-
     m = re.search(r"(\d+)\s*yıl\s*önce", s)
     if m:
         return base - relativedelta(years=int(m.group(1)))
@@ -113,15 +99,12 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
     m = re.search(r"(\d+)\s*day[s]?\s*ago", s)
     if m:
         return base - timedelta(days=int(m.group(1)))
-
     m = re.search(r"(\d+)\s*week[s]?\s*ago", s)
     if m:
         return base - timedelta(weeks=int(m.group(1)))
-
     m = re.search(r"(\d+)\s*month[s]?\s*ago", s)
     if m:
         return base - relativedelta(months=int(m.group(1)))
-
     m = re.search(r"(\d+)\s*year[s]?\s*ago", s)
     if m:
         return base - relativedelta(years=int(m.group(1)))
@@ -144,40 +127,88 @@ def apply_date_filter(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     return df.loc[mask].copy()
 
 
+def fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]:
+    """
+    returns (status_code, text)
+    """
+    last_status = 0
+    last_text = ""
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            last_status = r.status_code
+            last_text = r.text or ""
+            if r.status_code == 200 and last_text:
+                return last_status, last_text
+            # retry on temporary blocks
+            if r.status_code in {403, 429, 500, 502, 503, 504}:
+                time.sleep(1.2 + attempt * 0.8)
+                continue
+            return last_status, last_text
+        except Exception as e:
+            last_status = 0
+            last_text = f"ERROR: {type(e).__name__}: {e}"
+            time.sleep(1.0 + attempt * 0.5)
+    return last_status, last_text
+
+
 # ----------------------------
-# iOS: App Store Version History (TR/EN + relative time)
+# iOS: App Store Version History
 # ----------------------------
 @st.cache_data(ttl=60 * 30)
 def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
-    r = requests.get(app_url, headers=HEADERS, timeout=25)
-    r.raise_for_status()
+    status, html = fetch_text(app_url)
+    if status != 200:
+        return [{
+            "platform": "iOS",
+            "version": "N/A",
+            "released_at": None,
+            "age_text": "",
+            "notes": f"App Store fetch failed. HTTP {status}.",
+        }]
 
-    soup = BeautifulSoup(r.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    # Headings can be TR or EN
     headings = {"version history", "sürüm geçmişi"}
     stop_markers = {
         "app privacy", "uygulama gizliliği",
         "ratings & reviews", "derecelendirmeler ve yorumlar", "puanlar ve yorumlar",
-        "information", "bilgi"
+        "information", "bilgi",
     }
 
-    # Find start
     start_idx = None
     for i, ln in enumerate(lines):
         if ln.strip().lower() in headings:
             start_idx = i
             break
     if start_idx is None:
-        return []
+        return [{
+            "platform": "iOS",
+            "version": "N/A",
+            "released_at": None,
+            "age_text": "",
+            "notes": "Version History / Sürüm Geçmişi bulunamadı (Apple sayfa yapısı değişmiş olabilir).",
+        }]
 
     base = now_tr_date()
     out = []
     i = start_idx + 1
 
-    # Scan after heading: version -> relative/date -> notes until next version
+    def normalize_version_token(s: str) -> str:
+        s = s.strip()
+        low = s.lower()
+        if low.startswith("sürüm "):
+            return s.split(" ", 1)[1].strip()
+        if low.startswith("version "):
+            return s.split(" ", 1)[1].strip()
+        return s
+
+    def looks_like_version(s: str) -> bool:
+        s = normalize_version_token(s)
+        return bool(re.fullmatch(r"\d+(?:\.\d+){1,4}", s))
+
     while i < len(lines) and len(out) < max_items:
         ln = lines[i].strip()
         low = ln.lower()
@@ -185,17 +216,12 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
         if low in stop_markers:
             break
 
-        # Sometimes version appears like "Sürüm 9.6.4" or "Version 9.6.4"
-        if low.startswith("sürüm "):
-            ln = ln.split(" ", 1)[1].strip()
-        if low.startswith("version "):
-            ln = ln.split(" ", 1)[1].strip()
-
-        if not is_version_str(ln):
+        vtok = normalize_version_token(ln)
+        if not looks_like_version(vtok):
             i += 1
             continue
 
-        version = ln
+        version = vtok
         i += 1
         if i >= len(lines):
             break
@@ -212,17 +238,9 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
             if plow in stop_markers:
                 break
 
-            # Next version begins
-            pv = peek
-            pvlow = pv.lower()
-            if pvlow.startswith("sürüm "):
-                pv = pv.split(" ", 1)[1].strip()
-            if pvlow.startswith("version "):
-                pv = pv.split(" ", 1)[1].strip()
-            if is_version_str(pv):
+            if looks_like_version(peek):
                 break
 
-            # Skip obvious headers
             if plow in headings or plow in {"yenilikler", "what’s new", "what's new"}:
                 i += 1
                 continue
@@ -230,7 +248,6 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
             cleaned = peek.lstrip("*•- ").strip()
             if cleaned:
                 notes.append(cleaned)
-
             i += 1
 
         out.append({
@@ -238,77 +255,141 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
             "version": version,
             "released_at": released_at,
             "age_text": age_or_date,
-            "notes": clean_text(" ".join(notes))
+            "notes": clean_text(" ".join(notes)),
         })
 
     return out
 
 
 # ----------------------------
-# Android: best-effort (public)
+# Android: APKMirror All versions / All Releases
 # ----------------------------
+APKMIRROR_URL_BY_PACKAGE = {
+    # fizy
+    "com.turkcell.gncplay": "https://www.apkmirror.com/apk/lifecell-music/fizy-music-video/",
+    # BiP
+    "com.turkcell.bip": "https://www.apkmirror.com/apk/bip-a-s/bip-messenger/",
+    # lifebox
+    "tr.com.turkcell.akillidepo": "https://www.apkmirror.com/apk/lifecell-cloud/lifebox/",
+    # TV+ (APKMirror'da çoğunlukla Android TV release sayfasında "All Releases" listesi var)
+    # Bu URL, "All Releases" kısmını taşıyan bir release sayfası:
+    "com.turkcell.ott": "https://www.apkmirror.com/apk/lifecell-tv-yayin-ve-icerik-hizmetleri-a-s/tv-android-tv/tv-android-tv-4-0-1-release/",
+}
+
+
+def parse_apkmirror_versions_from_text(page_text: str, max_items: int) -> list[dict]:
+    """
+    APKMirror sayfalarında genelde:
+    - "All versions" veya "All Releases" başlığı
+    - ardından her item için:
+      "##### <App Name> <X.Y.Z>"
+      "<Month Day, Year>"
+      "Version:X.Y.Z"
+      "Uploaded:<...>"
+    """
+    lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
+    lower_lines = [ln.lower() for ln in lines]
+
+    headers = {"all versions", "all releases", "all release", "all releases:"}
+    start_idx = None
+    for i, ln in enumerate(lower_lines):
+        if ln in headers:
+            start_idx = i
+            break
+    if start_idx is None:
+        # bazen "All versions" görünmeyebilir ama "All Releases" farklı yerde geçebilir
+        for i, ln in enumerate(lower_lines):
+            if "all versions" in ln or "all releases" in ln:
+                start_idx = i
+                break
+    if start_idx is None:
+        return []
+
+    out = []
+    current_date = None
+    current_version = None
+
+    # Version format: 3.103.48-HEAD gibi değerleri de kabul edelim
+    def looks_like_android_version(v: str) -> bool:
+        v = (v or "").strip()
+        return bool(re.fullmatch(r"[0-9][0-9A-Za-z.\-_]+", v))
+
+    i = start_idx + 1
+    while i < len(lines) and len(out) < max_items:
+        ln = lines[i]
+
+        # yeni item genelde "##### ..."
+        if ln.startswith("#####"):
+            current_date = None
+            current_version = None
+            i += 1
+            continue
+
+        # tarih satırı (örn: "July 3, 2024")
+        if current_date is None:
+            try:
+                d = dtparser.parse(ln).date()
+                # çok alakasız parse'ları engellemek için yılı kontrol (çok eski de olabilir, sorun değil)
+                if 2009 <= d.year <= 2100:
+                    current_date = d
+            except Exception:
+                pass
+
+        # "Version:xxx"
+        if ln.lower().startswith("version:"):
+            v = ln.split(":", 1)[1].strip()
+            if looks_like_android_version(v):
+                current_version = v
+
+        # Eğer ikisi de hazırsa ekle
+        if current_date is not None and current_version is not None:
+            out.append({
+                "platform": "Android",
+                "version": current_version,
+                "released_at": current_date,
+                "notes": "",  # APKMirror listing sayfasında genelde per-version notes yok
+            })
+            current_date = None
+            current_version = None
+
+        i += 1
+
+    return out
+
+
 @st.cache_data(ttl=60 * 30)
-def fetch_android_latest(package_name: str, lang: str = "tr", country: str = "TR") -> dict | None:
-    # Public Play Store often returns "Varies with device" for version.
-    # We'll still show updated/changes best-effort.
-    lang = (lang or "tr").lower()
-    country = (country or "TR").upper()
-
-    # Try google_play_scraper first if installed (optional)
-    try:
-        from google_play_scraper import app as gp_app  # optional dependency
-        data = gp_app(package_name, lang=lang, country=country)
-
-        version = data.get("version") or "(unknown)"
-        updated_ms = data.get("updated")
-        released_at = None
-        if isinstance(updated_ms, (int, float)):
-            released_at = datetime.fromtimestamp(updated_ms / 1000).date()
-
-        notes = data.get("recentChanges") or ""
-        return {
+def fetch_android_versions_apkmirror(package_name: str, max_items: int = 3) -> list[dict]:
+    url = APKMIRROR_URL_BY_PACKAGE.get(package_name)
+    if not url:
+        return [{
             "platform": "Android",
-            "version": clean_text(version, 120),
-            "released_at": released_at,
-            "notes": clean_text(notes)
-        }
-    except Exception:
-        pass
+            "version": "N/A",
+            "released_at": None,
+            "notes": f"APKMirror URL mapping yok: {package_name}. (Koda mapping eklemek gerekir.)",
+        }]
 
-    # Fallback HTML (version usually not present)
-    try:
-        url = f"https://play.google.com/store/apps/details?id={package_name}&hl={lang}&gl={country}"
-        r = requests.get(url, headers=HEADERS, timeout=25)
-        r.raise_for_status()
-
-        soup = BeautifulSoup(r.text, "html.parser")
-        text = soup.get_text("\n")
-        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-
-        updated = None
-        notes = ""
-
-        for i, ln in enumerate(lines):
-            if ln.lower() == "updated on" and i + 1 < len(lines):
-                try:
-                    updated = dtparser.parse(lines[i + 1]).date()
-                except Exception:
-                    updated = None
-                break
-
-        for i, ln in enumerate(lines):
-            if ln.lower() in {"what’s new", "what's new"}:
-                notes = " ".join(lines[i + 1:i + 10]).strip()
-                break
-
-        return {
+    status, html = fetch_text(url)
+    if status != 200:
+        return [{
             "platform": "Android",
-            "version": "Varies with device",
-            "released_at": updated,
-            "notes": clean_text(notes)
-        }
-    except Exception:
-        return None
+            "version": "N/A",
+            "released_at": None,
+            "notes": f"APKMirror fetch failed. HTTP {status}. URL: {url}",
+        }]
+
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+
+    items = parse_apkmirror_versions_from_text(text, max_items=max_items)
+    if not items:
+        return [{
+            "platform": "Android",
+            "version": "N/A",
+            "released_at": None,
+            "notes": f"APKMirror'da 'All versions/All Releases' listesi parse edilemedi. URL: {url}",
+        }]
+
+    return items
 
 
 # ----------------------------
@@ -317,7 +398,7 @@ def fetch_android_latest(package_name: str, lang: str = "tr", country: str = "TR
 apps = load_apps_config(APP_CONFIG_PATH)
 
 st.title("QA Release Tracker")
-st.caption("iOS: Sürüm Geçmişi'nden son N versiyon + 'X gün önce' → tarih hesaplama. Android: public latest (best-effort).")
+st.caption("iOS: Sürüm Geçmişi'nden son N versiyon (+X gün önce → tarih). Android: APKMirror'dan son N versiyon.")
 
 with st.sidebar:
     st.header("Seçimler")
@@ -333,16 +414,14 @@ with st.sidebar:
         end = st.date_input("Bitiş", value=now_tr_date())
         last_n, unit = 30, "gün"
     else:
-        last_n = st.number_input("Son kaç?", min_value=1, max_value=3650, value=30)
+        last_n = st.number_input("Son kaç?", min_value=1, max_value=3650, value=8)
         unit = st.selectbox("Birim", ["gün", "hafta", "ay", "yıl"])
         start, end = now_tr_date() - timedelta(days=30), now_tr_date()
 
     start_date, end_date = compute_date_range(mode, start, end, int(last_n), unit)
 
     ios_last_n = st.slider("iOS kaç versiyon?", 1, 20, 3)
-
-    lang = st.selectbox("Android dil (hl)", ["tr", "en"], index=0)
-    country = st.selectbox("Android ülke (gl)", ["TR", "US", "GB", "DE"], index=0)
+    android_last_n = st.slider("Android kaç versiyon?", 1, 20, 3)
 
     run = st.button("Getir", type="primary")
 
@@ -360,33 +439,33 @@ if run:
                     "Version": it["version"],
                     "Release Date": it["released_at"],
                     "Age": it.get("age_text", ""),
-                    "Notes": it["notes"],
-                    "Source": "apps.apple.com"
+                    "Notes": it.get("notes", ""),
+                    "Source": "apps.apple.com",
                 })
 
     if "Android" in platforms:
-        with st.spinner("Android latest info çekiliyor..."):
-            a = fetch_android_latest(app_cfg["android_package"], lang=lang, country=country)
-            if a:
+        with st.spinner("Android (APKMirror) versiyonları çekiliyor..."):
+            android_items = fetch_android_versions_apkmirror(app_cfg["android_package"], max_items=android_last_n)
+            for it in android_items:
                 rows.append({
                     "App": app_cfg["name"],
                     "Platform": "Android",
-                    "Version": a["version"],
-                    "Release Date": a["released_at"],
+                    "Version": it["version"],
+                    "Release Date": it["released_at"],
                     "Age": "",
-                    "Notes": a["notes"],
-                    "Source": "play.google.com (best-effort)"
+                    "Notes": it.get("notes", ""),
+                    "Source": "apkmirror.com",
                 })
 
     df = pd.DataFrame(rows)
 
     if df.empty:
-        st.error("Hiç veri gelmedi. (Store erişimi engellenmiş olabilir veya link/package yanlış olabilir.)")
+        st.error("Hiç veri gelmedi.")
         st.stop()
 
     df = apply_date_filter(df, start_date, end_date)
 
-    # ISO week helper
+    # ISO Week
     dts = pd.to_datetime(df["Release Date"], errors="coerce")
     iso = dts.dt.isocalendar()
     df["ISO Week"] = iso["year"].astype("Int64").astype(str) + "-W" + iso["week"].astype("Int64").astype(str).str.zfill(2)
