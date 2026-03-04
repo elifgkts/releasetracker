@@ -59,7 +59,7 @@ def safe_parse_date(s: str) -> date | None:
 def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
     """
     App Store web sayfasındaki 'Version History' alanını parse eder.
-    NOT: Apple zaman zaman HTML'i değiştirir; yine de pratikte çoğu uygulamada çalışıyor.
+    Apple zaman zaman HTML'i değiştirir; bu yaklaşım 'best-effort' çalışır.
     """
     r = requests.get(app_url, headers=HEADERS, timeout=25)
     r.raise_for_status()
@@ -205,10 +205,19 @@ def fetch_android_latest(package_name: str, lang: str = "tr", country: str = "TR
 
 
 def apply_date_filter(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    """
+    FIX: pandas datetime64 ile python date karşılaştırma TypeError veriyordu.
+    Burada start/end'i Timestamp'a çevirip karşılaştırıyoruz.
+    """
     if df.empty or "Release Date" not in df.columns:
         return df
-    d = pd.to_datetime(df["Release Date"], errors="coerce").dt.date
-    mask = d.isna() | ((d >= start) & (d <= end))
+
+    d = pd.to_datetime(df["Release Date"], errors="coerce")
+
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+
+    mask = d.isna() | ((d >= start_ts) & (d <= end_ts))
     return df.loc[mask].copy()
 
 
