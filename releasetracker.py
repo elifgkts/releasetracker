@@ -20,6 +20,8 @@ HEADERS = {
 
 st.set_page_config(page_title="QA Release Tracker", layout="wide")
 
+IOS_STOP_MARKERS = {"app privacy", "ratings & reviews", "information", "developer website", "app support"}
+
 
 def load_apps_config(path: str) -> list[dict]:
     with open(path, "r", encoding="utf-8") as f:
@@ -49,17 +51,36 @@ def safe_parse_date(s: str) -> date | None:
     if not s:
         return None
     try:
-        # dayfirst=True Türkiye tarih formatı için daha iyi
         return dtparser.parse(s, dayfirst=True).date()
     except Exception:
         return None
 
 
+def is_version_str(s: str) -> bool:
+    s = (s or "").strip()
+    # 1.2.3 / 12.4 / 550.0.0 gibi
+    return bool(re.fullmatch(r"\d+(?:\.\d+){1,4}", s))
+
+
+def to_clean_text(x, max_len: int = 700) -> str:
+    """List/dict vs gelirse stringe çevir + çok uzunsa kısalt."""
+    if x is None:
+        return ""
+    if isinstance(x, list):
+        x = " ".join([str(i).strip() for i in x if str(i).strip()])
+    else:
+        x = str(x).strip()
+    x = re.sub(r"\s+", " ", x).strip()
+    if len(x) > max_len:
+        return x[:max_len].rstrip() + "…"
+    return x
+
+
 @st.cache_data(ttl=60 * 30)
 def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
     """
-    App Store web sayfasındaki 'Version History' alanını parse eder.
-    Apple zaman zaman HTML'i değiştirir; bu yaklaşım 'best-effort' çalışır.
+    iOS App Store 'Version History' bölümünden son N versiyonu yakalar.
+    HTML değişirse 'best-effort' çalışır.
     """
     r = requests.get(app_url, headers=HEADERS, timeout=25)
     r.raise_for_status()
@@ -68,7 +89,7 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
     text = soup.get_text("\n")
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
 
-    # Find "Version History"
+    # "Version History" bul
     vh_idx = None
     for i, ln in enumerate(lines):
         if ln.lower() == "version history":
@@ -80,40 +101,54 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
     out = []
     i = vh_idx + 1
 
-    # Extract blocks: #### <version> / <date> / notes
     while i < len(lines) and len(out) < max_items:
-        ln = lines[i]
+        ln = lines[i].strip()
 
-        # In many App Store pages, version entries appear like "#### 4.6.2"
-        m = re.match(r"^####\s*(.+)$", ln)
-        if not m:
+        # bazen "Version 4.6.2" gibi gelir
+        if ln.lower().startswith("version "):
+            candidate = ln.split(" ", 1)[1].strip()
+            if is_version_str(candidate):
+                ln = candidate
+
+        if not is_version_str(ln):
+            # stop marker'a girdiysek çık
+            if ln.lower() in IOS_STOP_MARKERS:
+                break
             i += 1
             continue
 
-        version = m.group(1).strip()
+        version = ln
         i += 1
         if i >= len(lines):
             break
 
-        date_str = lines[i].strip()
-        released_at = safe_parse_date(date_str)
+        released_at = safe_parse_date(lines[i])
         i += 1
 
         notes = []
         while i < len(lines):
             peek = lines[i].strip()
+            low = peek.lower()
 
-            # stop at next section
-            if peek.lower() in {"app privacy", "ratings & reviews", "information"}:
+            if low in IOS_STOP_MARKERS:
                 break
 
-            # next version block
-            if re.match(r"^####\s+.+$", peek):
+            # sonraki versiyon bloğu
+            cand = peek
+            if cand.lower().startswith("version "):
+                cand = cand.split(" ", 1)[1].strip()
+            if is_version_str(cand):
                 break
 
-            # notes usually have bullet prefix
-            if peek.startswith("*") or peek.startswith("•") or peek.startswith("-"):
-                notes.append(peek.lstrip("*•- ").strip())
+            # boş/başlık satırlarını filtrele
+            if low in {"what’s new", "what's new", "version history"}:
+                i += 1
+                continue
+
+            # notları topla
+            cleaned = peek.lstrip("*•- ").strip()
+            if cleaned:
+                notes.append(cleaned)
 
             i += 1
 
@@ -121,7 +156,7 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
             "platform": "iOS",
             "version": version,
             "released_at": released_at,
-            "notes": " ".join(notes).strip()
+            "notes": to_clean_text(" ".join(notes))
         })
 
     return out
@@ -130,18 +165,43 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
 @st.cache_data(ttl=60 * 30)
 def fetch_android_latest(package_name: str, lang: str = "tr", country: str = "TR") -> dict | None:
     """
-    Android tarafı public store’da genelde sadece 'latest' yakalanabiliyor.
-    1) gplay-scraper ile (no API key) versiyon + updated + what's new almayı dener.
-    2) olmazsa HTML fallback: Updated on + What's new (versiyon her zaman görünmeyebilir).
+    Android public kaynaklardan latest (best-effort).
+    Öncelik: google_play_scraper (daha stabil)
+    Fallback: gplay-scraper
+    Fallback: HTML
     """
     lang = (lang or "tr").lower()
-    country = (country or "TR").lower()
+    country = (country or "TR").upper()
 
-    # 1) gplay-scraper
+    # 1) google_play_scraper
     try:
-        from gplay_scraper import GPlayScraper  # pip: gplay-scraper
+        from google_play_scraper import app as gp_app
+
+        data = gp_app(package_name, lang=lang, country=country)
+
+        version = data.get("version") or "(unknown)"
+        updated_ms = data.get("updated")  # epoch ms
+        released_at = None
+        if isinstance(updated_ms, (int, float)):
+            released_at = datetime.fromtimestamp(updated_ms / 1000).date()
+
+        notes = data.get("recentChanges") or ""
+        notes = to_clean_text(notes)
+
+        return {
+            "platform": "Android",
+            "version": to_clean_text(version, max_len=120),
+            "released_at": released_at,
+            "notes": notes
+        }
+    except Exception:
+        pass
+
+    # 2) gplay-scraper
+    try:
+        from gplay_scraper import GPlayScraper
         scraper = GPlayScraper(http_client="requests")
-        data = scraper.app_analyze(package_name, lang=lang, country=country)
+        data = scraper.app_analyze(package_name, lang=lang, country=country.lower())
 
         def pick(*keys):
             for k in keys:
@@ -150,9 +210,9 @@ def fetch_android_latest(package_name: str, lang: str = "tr", country: str = "TR
                     return v
             return None
 
-        version = pick("version", "appVersion", "softwareVersion", "app_version_name", "app_version")
+        version = pick("version", "appVersion", "softwareVersion", "current_version", "currentVersion") or "(unknown)"
         updated_raw = pick("last_update_date", "last_update", "lastUpdate", "updated", "updated_on", "updatedOn")
-        notes = pick("update_notes", "recentChanges", "whats_new", "whatsNew", "changelog") or ""
+        notes = pick("recentChanges", "recent_changes", "whats_new", "whatsNew", "update_notes", "changelog") or ""
 
         released_at = None
         if isinstance(updated_raw, (int, float)):
@@ -165,18 +225,19 @@ def fetch_android_latest(package_name: str, lang: str = "tr", country: str = "TR
 
         return {
             "platform": "Android",
-            "version": str(version).strip() if version else "(unknown)",
+            "version": to_clean_text(version, max_len=120),
             "released_at": released_at,
-            "notes": str(notes).strip()
+            "notes": to_clean_text(notes)
         }
     except Exception:
         pass
 
-    # 2) fallback: HTML
+    # 3) HTML fallback (version genelde gelmez)
     try:
         url = f"https://play.google.com/store/apps/details?id={package_name}&hl={lang}&gl={country}"
         r = requests.get(url, headers=HEADERS, timeout=25)
         r.raise_for_status()
+
         soup = BeautifulSoup(r.text, "html.parser")
         text = soup.get_text("\n")
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -191,29 +252,24 @@ def fetch_android_latest(package_name: str, lang: str = "tr", country: str = "TR
 
         for i, ln in enumerate(lines):
             if ln.lower() in {"what’s new", "what's new"}:
-                notes = " ".join(lines[i + 1:i + 6]).strip()
+                notes = " ".join(lines[i + 1:i + 8]).strip()
                 break
 
         return {
             "platform": "Android",
             "version": "(not shown on web)",
             "released_at": updated,
-            "notes": notes
+            "notes": to_clean_text(notes)
         }
     except Exception:
         return None
 
 
 def apply_date_filter(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-    """
-    FIX: pandas datetime64 ile python date karşılaştırma TypeError veriyordu.
-    Burada start/end'i Timestamp'a çevirip karşılaştırıyoruz.
-    """
     if df.empty or "Release Date" not in df.columns:
         return df
 
     d = pd.to_datetime(df["Release Date"], errors="coerce")
-
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)
 
@@ -225,7 +281,7 @@ def apply_date_filter(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
 apps = load_apps_config(APP_CONFIG_PATH)
 
 st.title("QA Release Tracker (API’siz)")
-st.caption("iOS: Version History'den son N versiyon. Android: public store'dan latest (best-effort).")
+st.caption("iOS: Version History (son N). Android: public latest (best-effort).")
 
 with st.sidebar:
     st.header("Seçimler")
@@ -283,6 +339,12 @@ if run:
                     "Notes": a["notes"],
                     "Source": "play.google.com (best-effort)"
                 })
+
+                if str(a["version"]).lower().strip() == "varies with device":
+                    st.warning(
+                        "Android için Google Play public sayfası bazı uygulamalarda versiyon numarasını paylaşmıyor "
+                        "('Varies with device'). Bu durumda API’siz net versiyon almak mümkün olmayabilir."
+                    )
 
     df = pd.DataFrame(rows)
 
