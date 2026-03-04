@@ -1,11 +1,9 @@
-import io
 import re
 import time
 import yaml
 import requests
 import streamlit as st
 import pandas as pd
-import cloudscraper
 from bs4 import BeautifulSoup
 from datetime import date, timedelta, datetime
 from dateutil.relativedelta import relativedelta
@@ -35,7 +33,6 @@ def load_apps_config(path: str) -> list[dict]:
 
 
 def now_tr_date() -> date:
-    # Streamlit Cloud UTC olabilir; TR için +3 saat
     return (datetime.utcnow() + timedelta(hours=3)).date()
 
 
@@ -43,7 +40,6 @@ def compute_date_range(mode: str, start: date, end: date, last_n: int, unit: str
     today = now_tr_date()
     if mode == "Tarih aralığı":
         return start, end
-
     if unit == "gün":
         return today - timedelta(days=last_n), today
     if unit == "hafta":
@@ -52,7 +48,6 @@ def compute_date_range(mode: str, start: date, end: date, last_n: int, unit: str
         return today - relativedelta(months=last_n), today
     if unit == "yıl":
         return today - relativedelta(years=last_n), today
-
     return today - timedelta(days=30), today
 
 
@@ -69,10 +64,32 @@ def clean_text(x, max_len: int = 800) -> str:
     return x
 
 
+def fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]:
+    last_status = 0
+    last_text = ""
+    for attempt in range(retries + 1):
+        try:
+            r = requests.get(url, headers=HEADERS, timeout=timeout)
+            last_status = r.status_code
+            last_text = r.text or ""
+            if r.status_code == 200 and last_text:
+                return last_status, last_text
+            if r.status_code in {403, 429, 500, 502, 503, 504}:
+                time.sleep(1.2 + attempt * 0.8)
+                continue
+            return last_status, last_text
+        except Exception as e:
+            last_status = 0
+            last_text = f"ERROR: {type(e).__name__}: {e}"
+            time.sleep(1.0 + attempt * 0.5)
+    return last_status, last_text
+
+
 def parse_relative_or_date(s: str, base: date) -> date | None:
     """
     TR: '4 gün önce', '1 hafta önce', '1 ay önce', '2 yıl önce', 'dün', 'bugün'
     EN: '4 days ago', '1 week ago', '1 month ago', 'yesterday', 'today'
+    Ayrıca App Store bazen '5 Feb' gibi kısa tarih döndürüyor.
     """
     s = (s or "").strip().lower()
     if not s:
@@ -83,7 +100,6 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
     if s in {"dün", "yesterday"}:
         return base - timedelta(days=1)
 
-    # TR patterns
     m = re.search(r"(\d+)\s*gün\s*önce", s)
     if m:
         return base - timedelta(days=int(m.group(1)))
@@ -97,7 +113,6 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
     if m:
         return base - relativedelta(years=int(m.group(1)))
 
-    # EN patterns
     m = re.search(r"(\d+)\s*day[s]?\s*ago", s)
     if m:
         return base - timedelta(days=int(m.group(1)))
@@ -111,9 +126,12 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
     if m:
         return base - relativedelta(years=int(m.group(1)))
 
-    # Absolute date fallback
     try:
-        return dtparser.parse(s, dayfirst=True).date()
+        d = dtparser.parse(s, dayfirst=True).date()
+        # App Store bazen yıl vermiyor; gelecekse 1 yıl geri çek
+        if d > base + timedelta(days=7):
+            d = date(d.year - 1, d.month, d.day)
+        return d
     except Exception:
         return None
 
@@ -121,74 +139,11 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
 def apply_date_filter(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
     if df.empty or "Release Date" not in df.columns:
         return df
-
     d = pd.to_datetime(df["Release Date"], errors="coerce")
     start_ts = pd.Timestamp(start)
     end_ts = pd.Timestamp(end)
     mask = d.isna() | ((d >= start_ts) & (d <= end_ts))
     return df.loc[mask].copy()
-
-
-def fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]:
-    """
-    iOS için standart istek atıcı.
-    """
-    last_status = 0
-    last_text = ""
-    for attempt in range(retries + 1):
-        try:
-            r = requests.get(url, headers=HEADERS, timeout=timeout)
-            last_status = r.status_code
-            last_text = r.text or ""
-            if r.status_code == 200 and last_text:
-                return last_status, last_text
-            # retry on temporary blocks
-            if r.status_code in {403, 429, 500, 502, 503, 504}:
-                time.sleep(1.2 + attempt * 0.8)
-                continue
-            return last_status, last_text
-        except Exception as e:
-            last_status = 0
-            last_text = f"ERROR: {type(e).__name__}: {e}"
-            time.sleep(1.0 + attempt * 0.5)
-    return last_status, last_text
-
-
-def fetch_with_cloudscraper(url: str, timeout: int = 30, retries: int = 2) -> tuple[int, str]:
-    """
-    Android (APKMirror) için Cloudflare engelini aşabilen istek atıcı.
-    """
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'desktop': True
-        }
-    )
-    
-    last_status = 0
-    last_text = ""
-    
-    for attempt in range(retries + 1):
-        try:
-            r = scraper.get(url, timeout=timeout)
-            last_status = r.status_code
-            last_text = r.text or ""
-            
-            if r.status_code == 200 and last_text:
-                return last_status, last_text
-            
-            if r.status_code in {403, 429, 500, 502, 503, 504}:
-                time.sleep(2 + attempt * 1.5)
-                continue
-                
-            return last_status, last_text
-        except Exception as e:
-            last_status = 0
-            last_text = f"ERROR: {type(e).__name__}: {e}"
-            time.sleep(2 + attempt)
-            
-    return last_status, last_text
 
 
 # ----------------------------
@@ -251,7 +206,6 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
     while i < len(lines) and len(out) < max_items:
         ln = lines[i].strip()
         low = ln.lower()
-
         if low in stop_markers:
             break
 
@@ -276,10 +230,8 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
 
             if plow in stop_markers:
                 break
-
             if looks_like_version(peek):
                 break
-
             if plow in headings or plow in {"yenilikler", "what’s new", "what's new"}:
                 i += 1
                 continue
@@ -301,88 +253,134 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
 
 
 # ----------------------------
-# Android: APKMirror All versions / All Releases
+# Android: Uptodown "versions" pages
 # ----------------------------
-APKMIRROR_URL_BY_PACKAGE = {
-    # fizy
-    "com.turkcell.gncplay": "https://www.apkmirror.com/apk/lifecell-music/fizy-music-video/",
-    # BiP
-    "com.turkcell.bip": "https://www.apkmirror.com/apk/bip-a-s/bip-messenger/",
-    # lifebox
-    "tr.com.turkcell.akillidepo": "https://www.apkmirror.com/apk/lifecell-cloud/lifebox/",
-    # TV+
-    "com.turkcell.ott": "https://www.apkmirror.com/apk/lifecell-tv-yayin-ve-icerik-hizmetleri-a-s/tv-android-tv/tv-android-tv-4-0-1-release/",
+UPTODOWN_VERSIONS_URL_BY_PACKAGE = {
+    "com.turkcell.gncplay": "https://turkcell-gncplay.en.uptodown.com/android/versions",   # fizy
+    "com.turkcell.bip": "https://bip.en.uptodown.com/android/versions",                   # BiP
+    "tr.com.turkcell.akillidepo": "https://akll-depo.tr.uptodown.com/android/versions",   # lifebox
+    "com.turkcell.ott": "https://turkcell-tv.tr.uptodown.com/android/versions",           # TV+
+}
+
+TR_MONTHS = {
+    "oca": 1, "ocak": 1,
+    "şub": 2, "sub": 2, "şubat": 2, "subat": 2,
+    "mar": 3, "mart": 3,
+    "nis": 4, "nisan": 4,
+    "may": 5, "mayıs": 5, "mayis": 5,
+    "haz": 6, "haziran": 6,
+    "tem": 7, "temmuz": 7,
+    "ağu": 8, "agu": 8, "ağustos": 8, "agustos": 8,
+    "eyl": 9, "eylül": 9, "eylul": 9,
+    "eki": 10, "ekim": 10,
+    "kas": 11, "kasım": 11, "kasim": 11,
+    "ara": 12, "aralık": 12, "aralik": 12,
 }
 
 
-def parse_apkmirror_html(html_content: str, max_items: int) -> list[dict]:
-    soup = BeautifulSoup(html_content, "html.parser")
-    out = []
-    
-    rows = soup.find_all("div", class_=lambda x: x and "appRow" in x)
-    
-    for row in rows:
-        if len(out) >= max_items:
-            break
-            
-        title_tag = row.find(["h5", "h4", "a"], class_=lambda x: x and ("appRowTitle" in x or "fontBlack" in x))
-        date_tag = row.find(["span", "div", "p"], class_=lambda x: x and "dateyear_column" in x)
-        
-        if title_tag and date_tag:
-            raw_title = title_tag.get_text(strip=True)
-            raw_date = date_tag.get_text(strip=True)
-            
-            v_match = re.search(r"(\d+\.\d+(?:\.\d+)*[a-zA-Z0-9\-]*)", raw_title)
-            version = v_match.group(1) if v_match else raw_title
-            
+def parse_uptodown_date(date_str: str) -> date | None:
+    """
+    EN: "Jan 6, 2026"
+    TR: "17 Oca 2026"
+    """
+    s = (date_str or "").strip()
+    if not s:
+        return None
+
+    # Try dateutil first (works for EN and many formats)
+    try:
+        return dtparser.parse(s, dayfirst=True).date()
+    except Exception:
+        pass
+
+    # Turkish pattern: "17 Oca 2026"
+    m = re.match(r"^(\d{1,2})\s+([A-Za-zÇĞİÖŞÜçğıöşü\.]+)\s+(\d{4})$", s)
+    if m:
+        day = int(m.group(1))
+        mon_raw = m.group(2).strip().lower().replace(".", "")
+        year = int(m.group(3))
+        mon = TR_MONTHS.get(mon_raw)
+        if mon:
             try:
-                released_at = dtparser.parse(raw_date).date()
+                return date(year, mon, day)
             except Exception:
-                released_at = None
-                
-            if version and released_at:
-                out.append({
-                    "platform": "Android",
-                    "version": version,
-                    "released_at": released_at,
-                    "notes": ""
-                })
-                
-    return out
+                return None
+
+    return None
 
 
 @st.cache_data(ttl=60 * 30)
-def fetch_android_versions_apkmirror(package_name: str, max_items: int = 3) -> list[dict]:
-    url = APKMIRROR_URL_BY_PACKAGE.get(package_name)
+def fetch_android_versions_uptodown(package_name: str, max_items: int = 3) -> list[dict]:
+    url = UPTODOWN_VERSIONS_URL_BY_PACKAGE.get(package_name)
     if not url:
         return [{
             "platform": "Android",
             "version": "N/A",
             "released_at": None,
-            "notes": f"APKMirror URL mapping yok: {package_name}. (Koda mapping eklemek gerekir.)",
+            "notes": f"Uptodown URL mapping yok: {package_name}",
         }]
 
-    status, html = fetch_with_cloudscraper(url)
-    
+    status, html = fetch_text(url)
     if status != 200:
         return [{
             "platform": "Android",
             "version": "N/A",
             "released_at": None,
-            "notes": f"APKMirror fetch failed. HTTP {status}. Site bot koruması aktif olabilir. URL: {url}",
+            "notes": f"Uptodown fetch failed. HTTP {status}. URL: {url}",
         }]
 
-    items = parse_apkmirror_html(html, max_items=max_items)
-    
-    if not items:
+    soup = BeautifulSoup(html, "html.parser")
+    text = soup.get_text("\n")
+    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+
+    # Uptodown satır formatları:
+    # "apk 9.5.1 Android + 6.0 Jan 18, 2026"
+    # "xapk 4.3.50-HEAD Android + 7.0 Jan 6, 2026"
+    # TR: "apk 6.1.3 Android + 8.0 17 Oca 2026"
+    pattern = re.compile(
+        r"^(apk|xapk)\s+([0-9A-Za-z.\-_]+)\s+Android\s+\+\s*([0-9.]+)\s+(.+)$",
+        re.IGNORECASE
+    )
+
+    out = []
+    seen = set()
+
+    for ln in lines:
+        m = pattern.match(ln)
+        if not m:
+            continue
+
+        file_type = m.group(1).lower()
+        version = m.group(2).strip()
+        date_part = m.group(4).strip()
+
+        released_at = parse_uptodown_date(date_part)
+
+        key = (version, released_at)
+        if key in seen:
+            continue
+        seen.add(key)
+
+        out.append({
+            "platform": "Android",
+            "version": version,
+            "released_at": released_at,
+            "notes": "",  # Uptodown versions listesinde release note yok
+            "file_type": file_type,
+        })
+
+        if len(out) >= max_items:
+            break
+
+    if not out:
         return [{
             "platform": "Android",
             "version": "N/A",
             "released_at": None,
-            "notes": f"APKMirror sayfa yapısı değişmiş veya 'All versions' bulunamadı. URL: {url}",
+            "notes": f"Uptodown versions listesi parse edilemedi. URL: {url}",
         }]
 
-    return items
+    return out
 
 
 # ----------------------------
@@ -391,7 +389,7 @@ def fetch_android_versions_apkmirror(package_name: str, max_items: int = 3) -> l
 apps = load_apps_config(APP_CONFIG_PATH)
 
 st.title("QA Release Tracker")
-st.caption("iOS: Sürüm Geçmişi'nden son N versiyon. Android: APKMirror'dan son N versiyon.")
+st.caption("iOS: App Store Sürüm Geçmişi. Android: Uptodown versions listesi (son N).")
 
 with st.sidebar:
     st.header("Seçimler")
@@ -437,8 +435,8 @@ if run:
                 })
 
     if "Android" in platforms:
-        with st.spinner("Android (APKMirror) versiyonları çekiliyor..."):
-            android_items = fetch_android_versions_apkmirror(app_cfg["android_package"], max_items=android_last_n)
+        with st.spinner("Android (Uptodown) versiyonları çekiliyor..."):
+            android_items = fetch_android_versions_uptodown(app_cfg["android_package"], max_items=android_last_n)
             for it in android_items:
                 rows.append({
                     "App": app_cfg["name"],
@@ -447,7 +445,7 @@ if run:
                     "Release Date": it["released_at"],
                     "Age": "",
                     "Notes": it.get("notes", ""),
-                    "Source": "apkmirror.com",
+                    "Source": "uptodown.com",
                 })
 
     df = pd.DataFrame(rows)
@@ -473,17 +471,18 @@ if run:
         st.download_button(
             "CSV indir",
             df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{app_cfg.get('key', 'app')}_releases_{start_date}_{end_date}.csv",
+            file_name=f"{app_cfg['key']}_releases_{start_date}_{end_date}.csv",
             mime="text/csv",
         )
     with c2:
+        import io
         buff = io.BytesIO()
         with pd.ExcelWriter(buff, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="releases")
         st.download_button(
             "Excel indir",
             buff.getvalue(),
-            file_name=f"{app_cfg.get('key', 'app')}_releases_{start_date}_{end_date}.xlsx",
+            file_name=f"{app_cfg['key']}_releases_{start_date}_{end_date}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 else:
