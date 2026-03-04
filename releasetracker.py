@@ -405,7 +405,7 @@ def fetch_android_versions_uptodown(package_name: str) -> list[dict]:
 apps = load_apps_config(APP_CONFIG_PATH)
 
 st.title("QA Release Tracker")
-st.caption("iOS ve Android sürümleri ayrı tablolarda listelenir. Boşsa nedenini özetler.")
+st.caption("")
 
 with st.sidebar:
     st.header("Seçimler")
