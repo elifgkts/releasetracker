@@ -3,6 +3,7 @@ apps:
     name: fizy
     android_package: com.turkcell.gncplay
     ios_url: "https://apps.apple.com/tr/app/fizy-music-podcast/id404239912"
+    ios_bundle_id: "com.turkcell.fizy"   # <- Firebase Project Settings’ten
 
   - key: bip
     name: BiP
@@ -18,3 +19,5 @@ apps:
     name: TV+
     android_package: com.turkcell.ott
     ios_url: "https://apps.apple.com/tr/app/tv-movies-series-live-tv/id835880015"
+
+    
