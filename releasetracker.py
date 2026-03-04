@@ -1,3 +1,4 @@
+import io
 import re
 import time
 import yaml
@@ -8,6 +9,7 @@ from bs4 import BeautifulSoup
 from datetime import date, timedelta, datetime
 from dateutil.relativedelta import relativedelta
 from dateutil import parser as dtparser
+from google_play_scraper import app as play_app
 
 APP_CONFIG_PATH = "apps.yaml"
 
@@ -22,7 +24,6 @@ HEADERS = {
 
 st.set_page_config(page_title="QA Release Tracker", layout="wide")
 
-
 # ----------------------------
 # Utilities
 # ----------------------------
@@ -31,15 +32,15 @@ def load_apps_config(path: str) -> list[dict]:
         cfg = yaml.safe_load(f)
     return cfg.get("apps", [])
 
-
 def now_tr_date() -> date:
+    # Streamlit Cloud UTC olabilir; TR için +3 saat
     return (datetime.utcnow() + timedelta(hours=3)).date()
-
 
 def compute_date_range(mode: str, start: date, end: date, last_n: int, unit: str) -> tuple[date, date]:
     today = now_tr_date()
     if mode == "Tarih aralığı":
         return start, end
+
     if unit == "gün":
         return today - timedelta(days=last_n), today
     if unit == "hafta":
@@ -48,8 +49,8 @@ def compute_date_range(mode: str, start: date, end: date, last_n: int, unit: str
         return today - relativedelta(months=last_n), today
     if unit == "yıl":
         return today - relativedelta(years=last_n), today
-    return today - timedelta(days=30), today
 
+    return today - timedelta(days=30), today
 
 def clean_text(x, max_len: int = 800) -> str:
     if x is None:
@@ -63,6 +64,58 @@ def clean_text(x, max_len: int = 800) -> str:
         x = x[:max_len].rstrip() + "…"
     return x
 
+def parse_relative_or_date(s: str, base: date) -> date | None:
+    s = (s or "").strip().lower()
+    if not s:
+        return None
+
+    if s in {"bugün", "today"}:
+        return base
+    if s in {"dün", "yesterday"}:
+        return base - timedelta(days=1)
+
+    # TR patterns
+    m = re.search(r"(\d+)\s*gün\s*önce", s)
+    if m:
+        return base - timedelta(days=int(m.group(1)))
+    m = re.search(r"(\d+)\s*hafta\s*önce", s)
+    if m:
+        return base - timedelta(weeks=int(m.group(1)))
+    m = re.search(r"(\d+)\s*ay\s*önce", s)
+    if m:
+        return base - relativedelta(months=int(m.group(1)))
+    m = re.search(r"(\d+)\s*yıl\s*önce", s)
+    if m:
+        return base - relativedelta(years=int(m.group(1)))
+
+    # EN patterns
+    m = re.search(r"(\d+)\s*day[s]?\s*ago", s)
+    if m:
+        return base - timedelta(days=int(m.group(1)))
+    m = re.search(r"(\d+)\s*week[s]?\s*ago", s)
+    if m:
+        return base - timedelta(weeks=int(m.group(1)))
+    m = re.search(r"(\d+)\s*month[s]?\s*ago", s)
+    if m:
+        return base - relativedelta(months=int(m.group(1)))
+    m = re.search(r"(\d+)\s*year[s]?\s*ago", s)
+    if m:
+        return base - relativedelta(years=int(m.group(1)))
+
+    try:
+        return dtparser.parse(s, dayfirst=True).date()
+    except Exception:
+        return None
+
+def apply_date_filter(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+    if df.empty or "Release Date" not in df.columns:
+        return df
+
+    d = pd.to_datetime(df["Release Date"], errors="coerce")
+    start_ts = pd.Timestamp(start)
+    end_ts = pd.Timestamp(end)
+    mask = d.isna() | ((d >= start_ts) & (d <= end_ts))
+    return df.loc[mask].copy()
 
 def fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]:
     last_status = 0
@@ -83,68 +136,6 @@ def fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]
             last_text = f"ERROR: {type(e).__name__}: {e}"
             time.sleep(1.0 + attempt * 0.5)
     return last_status, last_text
-
-
-def parse_relative_or_date(s: str, base: date) -> date | None:
-    """
-    TR: '4 gün önce', '1 hafta önce', '1 ay önce', '2 yıl önce', 'dün', 'bugün'
-    EN: '4 days ago', '1 week ago', '1 month ago', 'yesterday', 'today'
-    Ayrıca App Store bazen '5 Feb' gibi kısa tarih döndürüyor.
-    """
-    s = (s or "").strip().lower()
-    if not s:
-        return None
-
-    if s in {"bugün", "today"}:
-        return base
-    if s in {"dün", "yesterday"}:
-        return base - timedelta(days=1)
-
-    m = re.search(r"(\d+)\s*gün\s*önce", s)
-    if m:
-        return base - timedelta(days=int(m.group(1)))
-    m = re.search(r"(\d+)\s*hafta\s*önce", s)
-    if m:
-        return base - timedelta(weeks=int(m.group(1)))
-    m = re.search(r"(\d+)\s*ay\s*önce", s)
-    if m:
-        return base - relativedelta(months=int(m.group(1)))
-    m = re.search(r"(\d+)\s*yıl\s*önce", s)
-    if m:
-        return base - relativedelta(years=int(m.group(1)))
-
-    m = re.search(r"(\d+)\s*day[s]?\s*ago", s)
-    if m:
-        return base - timedelta(days=int(m.group(1)))
-    m = re.search(r"(\d+)\s*week[s]?\s*ago", s)
-    if m:
-        return base - timedelta(weeks=int(m.group(1)))
-    m = re.search(r"(\d+)\s*month[s]?\s*ago", s)
-    if m:
-        return base - relativedelta(months=int(m.group(1)))
-    m = re.search(r"(\d+)\s*year[s]?\s*ago", s)
-    if m:
-        return base - relativedelta(years=int(m.group(1)))
-
-    try:
-        d = dtparser.parse(s, dayfirst=True).date()
-        # App Store bazen yıl vermiyor; gelecekse 1 yıl geri çek
-        if d > base + timedelta(days=7):
-            d = date(d.year - 1, d.month, d.day)
-        return d
-    except Exception:
-        return None
-
-
-def apply_date_filter(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
-    if df.empty or "Release Date" not in df.columns:
-        return df
-    d = pd.to_datetime(df["Release Date"], errors="coerce")
-    start_ts = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end)
-    mask = d.isna() | ((d >= start_ts) & (d <= end_ts))
-    return df.loc[mask].copy()
-
 
 # ----------------------------
 # iOS: App Store Version History
@@ -183,7 +174,7 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
             "version": "N/A",
             "released_at": None,
             "age_text": "",
-            "notes": "Version History / Sürüm Geçmişi bulunamadı (Apple sayfa yapısı değişmiş olabilir).",
+            "notes": "Version History / Sürüm Geçmişi bulunamadı.",
         }]
 
     base = now_tr_date()
@@ -206,6 +197,7 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
     while i < len(lines) and len(out) < max_items:
         ln = lines[i].strip()
         low = ln.lower()
+
         if low in stop_markers:
             break
 
@@ -230,8 +222,10 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
 
             if plow in stop_markers:
                 break
+
             if looks_like_version(peek):
                 break
+
             if plow in headings or plow in {"yenilikler", "what’s new", "what's new"}:
                 i += 1
                 continue
@@ -251,145 +245,56 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
 
     return out
 
-
 # ----------------------------
-# Android: Uptodown "versions" pages
+# Android: Google Play Store (Stable)
 # ----------------------------
-UPTODOWN_VERSIONS_URL_BY_PACKAGE = {
-    "com.turkcell.gncplay": "https://turkcell-gncplay.en.uptodown.com/android/versions",   # fizy
-    "com.turkcell.bip": "https://bip.en.uptodown.com/android/versions",                   # BiP
-    "tr.com.turkcell.akillidepo": "https://akll-depo.tr.uptodown.com/android/versions",   # lifebox
-    "com.turkcell.ott": "https://turkcell-tv.tr.uptodown.com/android/versions",           # TV+
-}
-
-TR_MONTHS = {
-    "oca": 1, "ocak": 1,
-    "şub": 2, "sub": 2, "şubat": 2, "subat": 2,
-    "mar": 3, "mart": 3,
-    "nis": 4, "nisan": 4,
-    "may": 5, "mayıs": 5, "mayis": 5,
-    "haz": 6, "haziran": 6,
-    "tem": 7, "temmuz": 7,
-    "ağu": 8, "agu": 8, "ağustos": 8, "agustos": 8,
-    "eyl": 9, "eylül": 9, "eylul": 9,
-    "eki": 10, "ekim": 10,
-    "kas": 11, "kasım": 11, "kasim": 11,
-    "ara": 12, "aralık": 12, "aralik": 12,
-}
-
-
-def parse_uptodown_date(date_str: str) -> date | None:
-    """
-    EN: "Jan 6, 2026"
-    TR: "17 Oca 2026"
-    """
-    s = (date_str or "").strip()
-    if not s:
-        return None
-
-    # Try dateutil first (works for EN and many formats)
-    try:
-        return dtparser.parse(s, dayfirst=True).date()
-    except Exception:
-        pass
-
-    # Turkish pattern: "17 Oca 2026"
-    m = re.match(r"^(\d{1,2})\s+([A-Za-zÇĞİÖŞÜçğıöşü\.]+)\s+(\d{4})$", s)
-    if m:
-        day = int(m.group(1))
-        mon_raw = m.group(2).strip().lower().replace(".", "")
-        year = int(m.group(3))
-        mon = TR_MONTHS.get(mon_raw)
-        if mon:
-            try:
-                return date(year, mon, day)
-            except Exception:
-                return None
-
-    return None
-
-
 @st.cache_data(ttl=60 * 30)
-def fetch_android_versions_uptodown(package_name: str, max_items: int = 3) -> list[dict]:
-    url = UPTODOWN_VERSIONS_URL_BY_PACKAGE.get(package_name)
-    if not url:
+def fetch_android_version_gplay(package_name: str) -> list[dict]:
+    try:
+        # Doğrudan Google Play veritabanından çekiyoruz
+        result = play_app(
+            package_name,
+            lang='tr',     # Sürüm notları Türkçe gelsin
+            country='tr'   # Türkiye mağazası verileri
+        )
+        
+        version = result.get('version', 'Bilinmiyor')
+        
+        updated_ts = result.get('updated')
+        if updated_ts:
+            released_at = datetime.fromtimestamp(updated_ts).date()
+        else:
+            released_at = None
+            
+        recent_changes = result.get('recentChanges')
+        notes = clean_text(recent_changes) if recent_changes else ""
+        
         return [{
             "platform": "Android",
-            "version": "N/A",
-            "released_at": None,
-            "notes": f"Uptodown URL mapping yok: {package_name}",
-        }]
-
-    status, html = fetch_text(url)
-    if status != 200:
-        return [{
-            "platform": "Android",
-            "version": "N/A",
-            "released_at": None,
-            "notes": f"Uptodown fetch failed. HTTP {status}. URL: {url}",
-        }]
-
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
-    lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
-
-    # Uptodown satır formatları:
-    # "apk 9.5.1 Android + 6.0 Jan 18, 2026"
-    # "xapk 4.3.50-HEAD Android + 7.0 Jan 6, 2026"
-    # TR: "apk 6.1.3 Android + 8.0 17 Oca 2026"
-    pattern = re.compile(
-        r"^(apk|xapk)\s+([0-9A-Za-z.\-_]+)\s+Android\s+\+\s*([0-9.]+)\s+(.+)$",
-        re.IGNORECASE
-    )
-
-    out = []
-    seen = set()
-
-    for ln in lines:
-        m = pattern.match(ln)
-        if not m:
-            continue
-
-        file_type = m.group(1).lower()
-        version = m.group(2).strip()
-        date_part = m.group(4).strip()
-
-        released_at = parse_uptodown_date(date_part)
-
-        key = (version, released_at)
-        if key in seen:
-            continue
-        seen.add(key)
-
-        out.append({
-            "platform": "Android",
-            "version": version,
+            "version": str(version),
             "released_at": released_at,
-            "notes": "",  # Uptodown versions listesinde release note yok
-            "file_type": file_type,
-        })
-
-        if len(out) >= max_items:
-            break
-
-    if not out:
+            "notes": notes
+        }]
+        
+    except Exception as e:
         return [{
             "platform": "Android",
             "version": "N/A",
             "released_at": None,
-            "notes": f"Uptodown versions listesi parse edilemedi. URL: {url}",
+            "notes": f"Play Store'dan veri çekilemedi. Hata: {e}"
         }]
-
-    return out
-
 
 # ----------------------------
 # UI
 # ----------------------------
-apps = load_apps_config(APP_CONFIG_PATH)
+try:
+    apps = load_apps_config(APP_CONFIG_PATH)
+except FileNotFoundError:
+    st.error(f"{APP_CONFIG_PATH} dosyası bulunamadı. Lütfen apps.yaml dosyasını ana dizine ekleyin.")
+    st.stop()
 
 st.title("QA Release Tracker")
-st.caption("iOS: App Store Sürüm Geçmişi. Android: Uptodown versions listesi (son N).")
+st.caption("iOS: Sürüm Geçmişi'nden son N versiyon. Android: Play Store'daki güncel versiyon.")
 
 with st.sidebar:
     st.header("Seçimler")
@@ -411,11 +316,9 @@ with st.sidebar:
 
     start_date, end_date = compute_date_range(mode, start, end, int(last_n), unit)
 
-    ios_last_n = st.slider("iOS kaç versiyon?", 1, 20, 3)
-    android_last_n = st.slider("Android kaç versiyon?", 1, 20, 3)
+    ios_last_n = st.slider("iOS kaç versiyon gelsin?", 1, 20, 3)
 
     run = st.button("Getir", type="primary")
-
 
 if run:
     rows = []
@@ -435,8 +338,8 @@ if run:
                 })
 
     if "Android" in platforms:
-        with st.spinner("Android (Uptodown) versiyonları çekiliyor..."):
-            android_items = fetch_android_versions_uptodown(app_cfg["android_package"], max_items=android_last_n)
+        with st.spinner("Android (Play Store) güncel versiyonu çekiliyor..."):
+            android_items = fetch_android_version_gplay(app_cfg["android_package"])
             for it in android_items:
                 rows.append({
                     "App": app_cfg["name"],
@@ -445,7 +348,7 @@ if run:
                     "Release Date": it["released_at"],
                     "Age": "",
                     "Notes": it.get("notes", ""),
-                    "Source": "uptodown.com",
+                    "Source": "play.google.com",
                 })
 
     df = pd.DataFrame(rows)
@@ -471,18 +374,17 @@ if run:
         st.download_button(
             "CSV indir",
             df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{app_cfg['key']}_releases_{start_date}_{end_date}.csv",
+            file_name=f"{app_cfg.get('key', 'app')}_releases_{start_date}_{end_date}.csv",
             mime="text/csv",
         )
     with c2:
-        import io
         buff = io.BytesIO()
         with pd.ExcelWriter(buff, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="releases")
         st.download_button(
             "Excel indir",
             buff.getvalue(),
-            file_name=f"{app_cfg['key']}_releases_{start_date}_{end_date}.xlsx",
+            file_name=f"{app_cfg.get('key', 'app')}_releases_{start_date}_{end_date}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 else:
