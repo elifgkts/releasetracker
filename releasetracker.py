@@ -74,7 +74,6 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
     if s in {"dün", "yesterday"}:
         return base - timedelta(days=1)
 
-    # TR patterns
     m = re.search(r"(\d+)\s*gün\s*önce", s)
     if m:
         return base - timedelta(days=int(m.group(1)))
@@ -88,7 +87,6 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
     if m:
         return base - relativedelta(years=int(m.group(1)))
 
-    # EN patterns
     m = re.search(r"(\d+)\s*day[s]?\s*ago", s)
     if m:
         return base - timedelta(days=int(m.group(1)))
@@ -136,6 +134,7 @@ def fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]
             last_text = f"ERROR: {type(e).__name__}: {e}"
             time.sleep(1.0 + attempt * 0.5)
     return last_status, last_text
+
 
 # ----------------------------
 # iOS: App Store Version History
@@ -246,19 +245,42 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
     return out
 
 # ----------------------------
-# Android: Google Play Store (Stable)
+# Android: Google Play Store + Aptoide Fallback
 # ----------------------------
+def get_aptoide_version(package_name: str) -> str:
+    """
+    Google Play versiyonu 'Varies with device' döndürdüğünde tam versiyonu Aptoide'den çeker.
+    """
+    try:
+        url = f"https://ws75.aptoide.com/api/7/app/get/package_name={package_name}"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if "nodes" in data and "meta" in data["nodes"] and "data" in data["nodes"]["meta"]:
+                app_data = data["nodes"]["meta"]["data"]
+                version = app_data.get("file", {}).get("vername")
+                return version
+    except Exception:
+        pass
+    return None
+
 @st.cache_data(ttl=60 * 30)
 def fetch_android_version_gplay(package_name: str) -> list[dict]:
     try:
-        # Doğrudan Google Play veritabanından çekiyoruz
+        # 1. Google Play'den genel bilgileri ve tarihi çek
         result = play_app(
             package_name,
-            lang='tr',     # Sürüm notları Türkçe gelsin
-            country='tr'   # Türkiye mağazası verileri
+            lang='tr',     
+            country='tr'   
         )
         
-        version = result.get('version', 'Bilinmiyor')
+        version = str(result.get('version', 'Bilinmiyor'))
+        
+        # 2. Eğer versiyon gizlenmişse Aptoide API'sine sor
+        if version.lower() in ["varies with device", "cihaza göre değişir", "bilinmiyor", "none"]:
+            fallback_version = get_aptoide_version(package_name)
+            if fallback_version:
+                version = fallback_version
         
         updated_ts = result.get('updated')
         if updated_ts:
@@ -271,7 +293,7 @@ def fetch_android_version_gplay(package_name: str) -> list[dict]:
         
         return [{
             "platform": "Android",
-            "version": str(version),
+            "version": version,
             "released_at": released_at,
             "notes": notes
         }]
@@ -338,7 +360,7 @@ if run:
                 })
 
     if "Android" in platforms:
-        with st.spinner("Android (Play Store) güncel versiyonu çekiliyor..."):
+        with st.spinner("Android güncel versiyonu çekiliyor..."):
             android_items = fetch_android_version_gplay(app_cfg["android_package"])
             for it in android_items:
                 rows.append({
@@ -348,7 +370,7 @@ if run:
                     "Release Date": it["released_at"],
                     "Age": "",
                     "Notes": it.get("notes", ""),
-                    "Source": "play.google.com",
+                    "Source": "play.google.com / aptoide",
                 })
 
     df = pd.DataFrame(rows)
