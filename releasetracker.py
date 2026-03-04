@@ -140,24 +140,8 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
         return None
 
 
-def summarize_items(items: list[dict], start: date, end: date) -> dict:
-    total = len(items)
-    parsed = [it for it in items if isinstance(it.get("released_at"), date)]
-    parsed_count = len(parsed)
-    unparsed_count = total - parsed_count
-    in_range = [it for it in parsed if start <= it["released_at"] <= end]
-    in_range_count = len(in_range)
-    out_of_range_count = parsed_count - in_range_count
-    return {
-        "total": total,
-        "parsed": parsed_count,
-        "unparsed": unparsed_count,
-        "in_range": in_range_count,
-        "out_of_range": out_of_range_count,
-    }
-
-
 def filter_in_range(items: list[dict], start: date, end: date) -> list[dict]:
+    """Tarihi parse edilemeyen kayıtları dahil etmeyiz (filtre mantığı net kalsın)."""
     return [
         it for it in items
         if isinstance(it.get("released_at"), date) and (start <= it["released_at"] <= end)
@@ -175,24 +159,20 @@ def add_iso_week(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def dedupe_and_sort(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    - Aynı Version (+Release Date) tekrarlarını atar
-    - Release Date'e göre yeni -> eski sıralar
-    """
+    """Duplicate versiyonları kaldır + kesin yeni->eski sırala + index'i sıfırla."""
     if df.empty:
         return df
 
     df = df.copy()
     df["_release_dt"] = pd.to_datetime(df["Release Date"], errors="coerce")
 
-    # önce yeni->eski sıralayıp, duplicate'i ilk kayıtta bırakıyoruz
+    # önce yeni->eski sıralayıp dupe'larda ilk kaydı tut
     df = df.sort_values(["_release_dt"], ascending=False, na_position="last")
     df = df.drop_duplicates(subset=["Version", "_release_dt"], keep="first")
 
-    # final sort (kesin yeni->eski)
+    # final sort: yeni->eski
     df = df.sort_values(["_release_dt", "Version"], ascending=[False, False], na_position="last")
-
-    df = df.drop(columns=["_release_dt"])
+    df = df.drop(columns=["_release_dt"]).reset_index(drop=True)
     return df
 
 
@@ -425,7 +405,7 @@ def fetch_android_versions_uptodown(package_name: str) -> list[dict]:
 apps = load_apps_config(APP_CONFIG_PATH)
 
 st.title("QA Release Tracker")
-st.caption("")
+st.caption("iOS ve Android ayrı tablolarda. Tekrar yok. Sıralama yeni→eski.")
 
 with st.sidebar:
     st.header("Seçimler")
@@ -453,13 +433,15 @@ with st.sidebar:
 if run:
     st.caption(f"Filtre: {start_date} – {end_date}")
 
-    # ---------------- iOS ----------------
-    ios_all, ios_stats, ios_df = [], None, pd.DataFrame()
+    # iOS
+    ios_df = pd.DataFrame()
     if "iOS" in platforms:
         with st.spinner("iOS sürüm geçmişi çekiliyor..."):
             ios_all = fetch_ios_version_history(app_cfg["ios_url"])
-        ios_stats = summarize_items(ios_all, start_date, end_date)
         ios_in_range = filter_in_range(ios_all, start_date, end_date)
+
+        if ios_all and ios_all[0].get("version") == "N/A":
+            st.warning(f"iOS kaynak mesajı: {ios_all[0].get('notes','')}")
 
         if ios_in_range:
             ios_df = pd.DataFrame([{
@@ -474,13 +456,15 @@ if run:
             ios_df = add_iso_week(ios_df)
             ios_df = dedupe_and_sort(ios_df)
 
-    # ---------------- Android ----------------
-    android_all, android_stats, android_df = [], None, pd.DataFrame()
+    # Android
+    android_df = pd.DataFrame()
     if "Android" in platforms:
         with st.spinner("Android sürüm geçmişi çekiliyor..."):
             android_all = fetch_android_versions_uptodown(app_cfg["android_package"])
-        android_stats = summarize_items(android_all, start_date, end_date)
         android_in_range = filter_in_range(android_all, start_date, end_date)
+
+        if android_all and android_all[0].get("version") == "N/A":
+            st.warning(f"Android kaynak mesajı: {android_all[0].get('notes','')}")
 
         if android_in_range:
             android_df = pd.DataFrame([{
@@ -495,25 +479,11 @@ if run:
             android_df = add_iso_week(android_df)
             android_df = dedupe_and_sort(android_df)
 
-    # ---------------- helpers ----------------
-    def show_stats(platform_name: str, stats: dict | None, raw_items: list[dict]):
-        if not stats:
-            return
-        st.write(
-            f"**{platform_name} özeti:** "
-            f"Toplam: {stats['total']} | Tarihi çözülen: {stats['parsed']} | "
-            f"Tarih çözülemeyen: {stats['unparsed']} | "
-            f"Aralık içinde: {stats['in_range']} | Aralık dışında: {stats['out_of_range']}"
-        )
-        if raw_items and raw_items[0].get("version") == "N/A" and raw_items[0].get("notes"):
-            st.warning(f"{platform_name} kaynak mesajı: {raw_items[0]['notes']}")
-
-    # ---------------- tables ----------------
+    # Tables
     if "iOS" in platforms:
         st.subheader("iOS")
-        show_stats("iOS", ios_stats, ios_all)
         if ios_df.empty:
-            st.info("Seçtiğin tarih aralığında iOS sürümü bulunamadı (veya tarih parse edilemedi).")
+            st.info("Seçtiğin tarih aralığında iOS kaydı bulunamadı.")
         else:
             st.dataframe(ios_df, use_container_width=True)
             st.download_button(
@@ -525,9 +495,8 @@ if run:
 
     if "Android" in platforms:
         st.subheader("Android")
-        show_stats("Android", android_stats, android_all)
         if android_df.empty:
-            st.info("Seçtiğin tarih aralığında Android sürümü bulunamadı (veya tarih parse edilemedi).")
+            st.info("Seçtiğin tarih aralığında Android kaydı bulunamadı.")
         else:
             st.dataframe(android_df, use_container_width=True)
             st.download_button(
@@ -537,6 +506,7 @@ if run:
                 mime="text/csv",
             )
 
+    # Combined download
     combined = pd.concat([df for df in [ios_df, android_df] if not df.empty], ignore_index=True)
     if not combined.empty:
         st.divider()
