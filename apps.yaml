@@ -1,0 +1,20 @@
+apps:
+  - key: fizy
+    name: fizy
+    android_package: com.turkcell.gncplay
+    ios_url: "https://apps.apple.com/tr/app/fizy-music-podcast/id404239912"
+
+  - key: bip
+    name: BiP
+    android_package: com.turkcell.bip
+    ios_url: "https://apps.apple.com/tr/app/bip-messenger-video-call/id583274826"
+
+  - key: lifebox
+    name: lifebox
+    android_package: tr.com.turkcell.akillidepo
+    ios_url: "https://apps.apple.com/tr/app/lifebox-storage-backup/id665036334"
+
+  - key: tvplus
+    name: TV+
+    android_package: com.turkcell.ott
+    ios_url: "https://apps.apple.com/tr/app/tv-movies-series-live-tv/id835880015"
