@@ -1,9 +1,11 @@
+import io
 import re
 import time
 import yaml
 import requests
 import streamlit as st
 import pandas as pd
+import cloudscraper
 from bs4 import BeautifulSoup
 from datetime import date, timedelta, datetime
 from dateutil.relativedelta import relativedelta
@@ -129,7 +131,7 @@ def apply_date_filter(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
 
 def fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]:
     """
-    returns (status_code, text)
+    iOS için standart istek atıcı.
     """
     last_status = 0
     last_text = ""
@@ -149,6 +151,43 @@ def fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]
             last_status = 0
             last_text = f"ERROR: {type(e).__name__}: {e}"
             time.sleep(1.0 + attempt * 0.5)
+    return last_status, last_text
+
+
+def fetch_with_cloudscraper(url: str, timeout: int = 30, retries: int = 2) -> tuple[int, str]:
+    """
+    Android (APKMirror) için Cloudflare engelini aşabilen istek atıcı.
+    """
+    scraper = cloudscraper.create_scraper(
+        browser={
+            'browser': 'chrome',
+            'platform': 'windows',
+            'desktop': True
+        }
+    )
+    
+    last_status = 0
+    last_text = ""
+    
+    for attempt in range(retries + 1):
+        try:
+            r = scraper.get(url, timeout=timeout)
+            last_status = r.status_code
+            last_text = r.text or ""
+            
+            if r.status_code == 200 and last_text:
+                return last_status, last_text
+            
+            if r.status_code in {403, 429, 500, 502, 503, 504}:
+                time.sleep(2 + attempt * 1.5)
+                continue
+                
+            return last_status, last_text
+        except Exception as e:
+            last_status = 0
+            last_text = f"ERROR: {type(e).__name__}: {e}"
+            time.sleep(2 + attempt)
+            
     return last_status, last_text
 
 
@@ -271,89 +310,44 @@ APKMIRROR_URL_BY_PACKAGE = {
     "com.turkcell.bip": "https://www.apkmirror.com/apk/bip-a-s/bip-messenger/",
     # lifebox
     "tr.com.turkcell.akillidepo": "https://www.apkmirror.com/apk/lifecell-cloud/lifebox/",
-    # TV+ (APKMirror'da çoğunlukla Android TV release sayfasında "All Releases" listesi var)
-    # Bu URL, "All Releases" kısmını taşıyan bir release sayfası:
+    # TV+
     "com.turkcell.ott": "https://www.apkmirror.com/apk/lifecell-tv-yayin-ve-icerik-hizmetleri-a-s/tv-android-tv/tv-android-tv-4-0-1-release/",
 }
 
 
-def parse_apkmirror_versions_from_text(page_text: str, max_items: int) -> list[dict]:
-    """
-    APKMirror sayfalarında genelde:
-    - "All versions" veya "All Releases" başlığı
-    - ardından her item için:
-      "##### <App Name> <X.Y.Z>"
-      "<Month Day, Year>"
-      "Version:X.Y.Z"
-      "Uploaded:<...>"
-    """
-    lines = [ln.strip() for ln in page_text.splitlines() if ln.strip()]
-    lower_lines = [ln.lower() for ln in lines]
-
-    headers = {"all versions", "all releases", "all release", "all releases:"}
-    start_idx = None
-    for i, ln in enumerate(lower_lines):
-        if ln in headers:
-            start_idx = i
-            break
-    if start_idx is None:
-        # bazen "All versions" görünmeyebilir ama "All Releases" farklı yerde geçebilir
-        for i, ln in enumerate(lower_lines):
-            if "all versions" in ln or "all releases" in ln:
-                start_idx = i
-                break
-    if start_idx is None:
-        return []
-
+def parse_apkmirror_html(html_content: str, max_items: int) -> list[dict]:
+    soup = BeautifulSoup(html_content, "html.parser")
     out = []
-    current_date = None
-    current_version = None
-
-    # Version format: 3.103.48-HEAD gibi değerleri de kabul edelim
-    def looks_like_android_version(v: str) -> bool:
-        v = (v or "").strip()
-        return bool(re.fullmatch(r"[0-9][0-9A-Za-z.\-_]+", v))
-
-    i = start_idx + 1
-    while i < len(lines) and len(out) < max_items:
-        ln = lines[i]
-
-        # yeni item genelde "##### ..."
-        if ln.startswith("#####"):
-            current_date = None
-            current_version = None
-            i += 1
-            continue
-
-        # tarih satırı (örn: "July 3, 2024")
-        if current_date is None:
+    
+    rows = soup.find_all("div", class_=lambda x: x and "appRow" in x)
+    
+    for row in rows:
+        if len(out) >= max_items:
+            break
+            
+        title_tag = row.find(["h5", "h4", "a"], class_=lambda x: x and ("appRowTitle" in x or "fontBlack" in x))
+        date_tag = row.find(["span", "div", "p"], class_=lambda x: x and "dateyear_column" in x)
+        
+        if title_tag and date_tag:
+            raw_title = title_tag.get_text(strip=True)
+            raw_date = date_tag.get_text(strip=True)
+            
+            v_match = re.search(r"(\d+\.\d+(?:\.\d+)*[a-zA-Z0-9\-]*)", raw_title)
+            version = v_match.group(1) if v_match else raw_title
+            
             try:
-                d = dtparser.parse(ln).date()
-                # çok alakasız parse'ları engellemek için yılı kontrol (çok eski de olabilir, sorun değil)
-                if 2009 <= d.year <= 2100:
-                    current_date = d
+                released_at = dtparser.parse(raw_date).date()
             except Exception:
-                pass
-
-        # "Version:xxx"
-        if ln.lower().startswith("version:"):
-            v = ln.split(":", 1)[1].strip()
-            if looks_like_android_version(v):
-                current_version = v
-
-        # Eğer ikisi de hazırsa ekle
-        if current_date is not None and current_version is not None:
-            out.append({
-                "platform": "Android",
-                "version": current_version,
-                "released_at": current_date,
-                "notes": "",  # APKMirror listing sayfasında genelde per-version notes yok
-            })
-            current_date = None
-            current_version = None
-
-        i += 1
-
+                released_at = None
+                
+            if version and released_at:
+                out.append({
+                    "platform": "Android",
+                    "version": version,
+                    "released_at": released_at,
+                    "notes": ""
+                })
+                
     return out
 
 
@@ -368,25 +362,24 @@ def fetch_android_versions_apkmirror(package_name: str, max_items: int = 3) -> l
             "notes": f"APKMirror URL mapping yok: {package_name}. (Koda mapping eklemek gerekir.)",
         }]
 
-    status, html = fetch_text(url)
+    status, html = fetch_with_cloudscraper(url)
+    
     if status != 200:
         return [{
             "platform": "Android",
             "version": "N/A",
             "released_at": None,
-            "notes": f"APKMirror fetch failed. HTTP {status}. URL: {url}",
+            "notes": f"APKMirror fetch failed. HTTP {status}. Site bot koruması aktif olabilir. URL: {url}",
         }]
 
-    soup = BeautifulSoup(html, "html.parser")
-    text = soup.get_text("\n")
-
-    items = parse_apkmirror_versions_from_text(text, max_items=max_items)
+    items = parse_apkmirror_html(html, max_items=max_items)
+    
     if not items:
         return [{
             "platform": "Android",
             "version": "N/A",
             "released_at": None,
-            "notes": f"APKMirror'da 'All versions/All Releases' listesi parse edilemedi. URL: {url}",
+            "notes": f"APKMirror sayfa yapısı değişmiş veya 'All versions' bulunamadı. URL: {url}",
         }]
 
     return items
@@ -398,7 +391,7 @@ def fetch_android_versions_apkmirror(package_name: str, max_items: int = 3) -> l
 apps = load_apps_config(APP_CONFIG_PATH)
 
 st.title("QA Release Tracker")
-st.caption("iOS: Sürüm Geçmişi'nden son N versiyon (+X gün önce → tarih). Android: APKMirror'dan son N versiyon.")
+st.caption("iOS: Sürüm Geçmişi'nden son N versiyon. Android: APKMirror'dan son N versiyon.")
 
 with st.sidebar:
     st.header("Seçimler")
@@ -480,18 +473,17 @@ if run:
         st.download_button(
             "CSV indir",
             df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{app_cfg['key']}_releases_{start_date}_{end_date}.csv",
+            file_name=f"{app_cfg.get('key', 'app')}_releases_{start_date}_{end_date}.csv",
             mime="text/csv",
         )
     with c2:
-        import io
         buff = io.BytesIO()
         with pd.ExcelWriter(buff, engine="openpyxl") as writer:
             df.to_excel(writer, index=False, sheet_name="releases")
         st.download_button(
             "Excel indir",
             buff.getvalue(),
-            file_name=f"{app_cfg['key']}_releases_{start_date}_{end_date}.xlsx",
+            file_name=f"{app_cfg.get('key', 'app')}_releases_{start_date}_{end_date}.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 else:
