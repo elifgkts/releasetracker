@@ -33,6 +33,7 @@ def load_apps_config(path: str) -> list[dict]:
 
 
 def now_tr_date() -> date:
+    # Streamlit Cloud UTC olabiliyor; TR için +3 saat
     return (datetime.utcnow() + timedelta(hours=3)).date()
 
 
@@ -40,6 +41,7 @@ def compute_date_range(mode: str, start: date, end: date, last_n: int, unit: str
     today = now_tr_date()
     if mode == "Tarih aralığı":
         return start, end
+
     if unit == "gün":
         return today - timedelta(days=last_n), today
     if unit == "hafta":
@@ -48,6 +50,7 @@ def compute_date_range(mode: str, start: date, end: date, last_n: int, unit: str
         return today - relativedelta(months=last_n), today
     if unit == "yıl":
         return today - relativedelta(years=last_n), today
+
     return today - timedelta(days=30), today
 
 
@@ -89,6 +92,7 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
     """
     TR: '4 gün önce', '1 hafta önce', '1 ay önce', '2 yıl önce', 'dün', 'bugün'
     EN: '4 days ago', '1 week ago', '1 month ago', 'yesterday', 'today'
+    App Store kısa tarih: '5 Feb' gibi
     """
     s = (s or "").strip().lower()
     if not s:
@@ -130,6 +134,7 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
     # Absolute fallback
     try:
         d = dtparser.parse(s, dayfirst=True).date()
+        # yıl yoksa bazen geleceğe düşebiliyor -> 1 yıl geri çek
         if d > base + timedelta(days=7):
             d = date(d.year - 1, d.month, d.day)
         return d
@@ -137,21 +142,45 @@ def parse_relative_or_date(s: str, base: date) -> date | None:
         return None
 
 
-def apply_date_filter(df: pd.DataFrame, start: date, end: date) -> pd.DataFrame:
+def summarize_items(items: list[dict], start: date, end: date) -> dict:
+    total = len(items)
+    parsed = [it for it in items if isinstance(it.get("released_at"), date)]
+    parsed_count = len(parsed)
+    unparsed_count = total - parsed_count
+    in_range = [it for it in parsed if start <= it["released_at"] <= end]
+    in_range_count = len(in_range)
+    out_of_range_count = parsed_count - in_range_count
+    return {
+        "total": total,
+        "parsed": parsed_count,
+        "unparsed": unparsed_count,
+        "in_range": in_range_count,
+        "out_of_range": out_of_range_count,
+    }
+
+
+def filter_in_range(items: list[dict], start: date, end: date) -> list[dict]:
+    return [
+        it for it in items
+        if isinstance(it.get("released_at"), date) and (start <= it["released_at"] <= end)
+    ]
+
+
+def add_iso_week(df: pd.DataFrame) -> pd.DataFrame:
     if df.empty or "Release Date" not in df.columns:
         return df
-    d = pd.to_datetime(df["Release Date"], errors="coerce")
-    start_ts = pd.Timestamp(start)
-    end_ts = pd.Timestamp(end)
-    mask = d.isna() | ((d >= start_ts) & (d <= end_ts))
-    return df.loc[mask].copy()
+    dts = pd.to_datetime(df["Release Date"], errors="coerce")
+    iso = dts.dt.isocalendar()
+    df = df.copy()
+    df["ISO Week"] = iso["year"].astype("Int64").astype(str) + "-W" + iso["week"].astype("Int64").astype(str).str.zfill(2)
+    return df
 
 
 # ----------------------------
-# iOS: App Store Version History
+# iOS: App Store Version History (tam listeyi dolaşır)
 # ----------------------------
 @st.cache_data(ttl=60 * 30)
-def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
+def fetch_ios_version_history(app_url: str) -> list[dict]:
     status, html = fetch_text(app_url)
     if status != 200:
         return [{
@@ -184,7 +213,7 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
             "version": "N/A",
             "released_at": None,
             "age_text": "",
-            "notes": "Version History / Sürüm Geçmişi bulunamadı (Apple sayfa yapısı değişmiş olabilir).",
+            "notes": "Sürüm Geçmişi / Version History bulunamadı (Apple sayfa yapısı değişmiş olabilir).",
         }]
 
     base = now_tr_date()
@@ -204,7 +233,7 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
         s = normalize_version_token(s)
         return bool(re.fullmatch(r"\d+(?:\.\d+){1,4}", s))
 
-    while i < len(lines) and len(out) < max_items:
+    while i < len(lines):
         ln = lines[i].strip()
         low = ln.lower()
         if low in stop_markers:
@@ -254,7 +283,7 @@ def fetch_ios_version_history(app_url: str, max_items: int = 10) -> list[dict]:
 
 
 # ----------------------------
-# Android: Uptodown versions (robust parser)
+# Android: Uptodown versions (tam liste)
 # ----------------------------
 UPTODOWN_VERSIONS_URL_BY_PACKAGE = {
     "com.turkcell.gncplay": "https://turkcell-gncplay.en.uptodown.com/android/versions",  # fizy
@@ -282,14 +311,10 @@ def parse_uptodown_date(date_str: str) -> date | None:
     s = (date_str or "").strip()
     if not s:
         return None
-
-    # Try dateutil (EN like "Jan 18, 2026")
     try:
         return dtparser.parse(s, dayfirst=True).date()
     except Exception:
         pass
-
-    # TR like "17 Oca 2026"
     m = re.match(r"^(\d{1,2})\s+([A-Za-zÇĞİÖŞÜçğıöşü\.]+)\s+(\d{4})$", s)
     if m:
         day = int(m.group(1))
@@ -301,27 +326,14 @@ def parse_uptodown_date(date_str: str) -> date | None:
                 return date(year, mon, day)
             except Exception:
                 return None
-
     return None
 
 
-def extract_uptodown_versions(full_text: str, max_items: int) -> list[dict]:
-    """
-    FULL TEXT üzerinden arar (satır başı şartı yok) -> Uptodown bazen metni tek satıra yapıştırabiliyor.
-    Örnek match:
-      apk 9.5.1 Android + 6.0 Jan 18, 2026
-      xapk 4.4.43-HEAD Android + 7.0 Feb 3, 2026
-    """
-    # normalize whitespace & nbsp
+def extract_uptodown_versions(full_text: str) -> list[dict]:
     t = (full_text or "").replace("\xa0", " ")
     t = re.sub(r"\s+", " ", t).strip()
 
-    # date can be:
-    # - "Jan 18, 2026"
-    # - "17 Oca 2026"
     date_pat = r"(?:[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü\.]+\s+\d{4})"
-
-    # IMPORTANT: not anchored
     pat = re.compile(
         rf"\b(apk|xapk)\s+([0-9A-Za-z.\-_]+)\s+Android\s*\+\s*([0-9.]+)\s+({date_pat})\b",
         re.IGNORECASE
@@ -345,17 +357,14 @@ def extract_uptodown_versions(full_text: str, max_items: int) -> list[dict]:
             "platform": "Android",
             "version": version,
             "released_at": released_at,
-            "notes": f"{file_type.upper()}",
+            "notes": file_type.upper(),
         })
-
-        if len(out) >= max_items:
-            break
 
     return out
 
 
 @st.cache_data(ttl=60 * 30)
-def fetch_android_versions_uptodown(package_name: str, max_items: int = 3) -> list[dict]:
+def fetch_android_versions_uptodown(package_name: str) -> list[dict]:
     url = UPTODOWN_VERSIONS_URL_BY_PACKAGE.get(package_name)
     if not url:
         return [{
@@ -377,15 +386,14 @@ def fetch_android_versions_uptodown(package_name: str, max_items: int = 3) -> li
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
 
-    items = extract_uptodown_versions(text, max_items=max_items)
+    items = extract_uptodown_versions(text)
     if not items:
-        # Tiny debug snippet (helps us if any further)
         snippet = clean_text(text, 500)
         return [{
             "platform": "Android",
             "version": "N/A",
             "released_at": None,
-            "notes": f"Uptodown parse edilemedi. (Sayfa geldi ama pattern yok) Snippet: {snippet}",
+            "notes": f"Uptodown parse edilemedi. Snippet: {snippet}",
         }]
 
     return items
@@ -397,7 +405,7 @@ def fetch_android_versions_uptodown(package_name: str, max_items: int = 3) -> li
 apps = load_apps_config(APP_CONFIG_PATH)
 
 st.title("QA Release Tracker")
-st.caption("iOS: App Store Sürüm Geçmişi. Android: Uptodown (son N).")
+st.caption("iOS ve Android sürümleri ayrı tablolarda listelenir. Boşsa nedenini özetler.")
 
 with st.sidebar:
     st.header("Seçimler")
@@ -419,78 +427,124 @@ with st.sidebar:
 
     start_date, end_date = compute_date_range(mode, start, end, int(last_n), unit)
 
-    ios_last_n = st.slider("iOS kaç versiyon?", 1, 20, 3)
-    android_last_n = st.slider("Android kaç versiyon?", 1, 20, 3)
-
     run = st.button("Getir", type="primary")
 
 
 if run:
-    rows = []
+    st.caption(f"Filtre: {start_date} – {end_date}")
+
+    # ---------------- iOS ----------------
+    ios_all = []
+    ios_stats = None
+    ios_df = pd.DataFrame()
 
     if "iOS" in platforms:
-        with st.spinner("iOS Sürüm Geçmişi çekiliyor..."):
-            ios_items = fetch_ios_version_history(app_cfg["ios_url"], max_items=ios_last_n)
-            for it in ios_items:
-                rows.append({
-                    "App": app_cfg["name"],
-                    "Platform": "iOS",
-                    "Version": it["version"],
-                    "Release Date": it["released_at"],
-                    "Age": it.get("age_text", ""),
-                    "Notes": it.get("notes", ""),
-                    "Source": "apps.apple.com",
-                })
+        with st.spinner("iOS sürüm geçmişi çekiliyor..."):
+            ios_all = fetch_ios_version_history(app_cfg["ios_url"])
+        ios_stats = summarize_items(ios_all, start_date, end_date)
+        ios_in_range = filter_in_range(ios_all, start_date, end_date)
+
+        if ios_in_range:
+            ios_df = pd.DataFrame([{
+                "App": app_cfg["name"],
+                "Platform": "iOS",
+                "Version": it["version"],
+                "Release Date": it["released_at"],
+                "Age": it.get("age_text", ""),
+                "Notes": it.get("notes", ""),
+                "Source": "apps.apple.com",
+            } for it in ios_in_range])
+            ios_df = add_iso_week(ios_df).sort_values("Release Date", ascending=False)
+
+    # ---------------- Android ----------------
+    android_all = []
+    android_stats = None
+    android_df = pd.DataFrame()
 
     if "Android" in platforms:
-        with st.spinner("Android (Uptodown) versiyonları çekiliyor..."):
-            android_items = fetch_android_versions_uptodown(app_cfg["android_package"], max_items=android_last_n)
-            for it in android_items:
-                rows.append({
-                    "App": app_cfg["name"],
-                    "Platform": "Android",
-                    "Version": it["version"],
-                    "Release Date": it["released_at"],
-                    "Age": "",
-                    "Notes": it.get("notes", ""),
-                    "Source": "uptodown.com",
-                })
+        with st.spinner("Android sürüm geçmişi çekiliyor..."):
+            android_all = fetch_android_versions_uptodown(app_cfg["android_package"])
+        android_stats = summarize_items(android_all, start_date, end_date)
+        android_in_range = filter_in_range(android_all, start_date, end_date)
 
-    df = pd.DataFrame(rows)
+        if android_in_range:
+            android_df = pd.DataFrame([{
+                "App": app_cfg["name"],
+                "Platform": "Android",
+                "Version": it["version"],
+                "Release Date": it["released_at"],
+                "Age": "",
+                "Notes": it.get("notes", ""),
+                "Source": "uptodown.com",
+            } for it in android_in_range])
+            android_df = add_iso_week(android_df).sort_values("Release Date", ascending=False)
 
-    if df.empty:
-        st.error("Hiç veri gelmedi.")
-        st.stop()
-
-    df = apply_date_filter(df, start_date, end_date)
-
-    dts = pd.to_datetime(df["Release Date"], errors="coerce")
-    iso = dts.dt.isocalendar()
-    df["ISO Week"] = iso["year"].astype("Int64").astype(str) + "-W" + iso["week"].astype("Int64").astype(str).str.zfill(2)
-
-    df = df.sort_values(["Platform", "Release Date"], ascending=[True, False], na_position="last")
-
-    st.caption(f"Filtre: {start_date} – {end_date}")
-    st.dataframe(df, use_container_width=True)
-
-    c1, c2 = st.columns(2)
-    with c1:
-        st.download_button(
-            "CSV indir",
-            df.to_csv(index=False).encode("utf-8"),
-            file_name=f"{app_cfg['key']}_releases_{start_date}_{end_date}.csv",
-            mime="text/csv",
+    # ---------------- Messages (why empty?) ----------------
+    def show_stats(platform_name: str, stats: dict | None, raw_items: list[dict]):
+        if not stats:
+            return
+        st.write(
+            f"**{platform_name} özeti:** "
+            f"Toplam: {stats['total']} | Tarihi çözülen: {stats['parsed']} | "
+            f"Tarih çözülemeyen: {stats['unparsed']} | "
+            f"Aralık içinde: {stats['in_range']} | Aralık dışında: {stats['out_of_range']}"
         )
-    with c2:
-        import io
-        buff = io.BytesIO()
-        with pd.ExcelWriter(buff, engine="openpyxl") as writer:
-            df.to_excel(writer, index=False, sheet_name="releases")
-        st.download_button(
-            "Excel indir",
-            buff.getvalue(),
-            file_name=f"{app_cfg['key']}_releases_{start_date}_{end_date}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
+        # Eğer N/A satırı döndüyse, notu göster (fetch/parse sorunu gibi)
+        if raw_items and raw_items[0].get("version") == "N/A" and raw_items[0].get("notes"):
+            st.warning(f"{platform_name} kaynak mesajı: {raw_items[0]['notes']}")
+
+    # ---------------- Tables ----------------
+    if "iOS" in platforms:
+        st.subheader("iOS")
+        show_stats("iOS", ios_stats, ios_all)
+        if ios_df.empty:
+            st.info("Seçtiğin tarih aralığında iOS sürümü bulunamadı (veya tarih parse edilemedi).")
+        else:
+            st.dataframe(ios_df, use_container_width=True)
+            st.download_button(
+                "iOS CSV indir",
+                ios_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{app_cfg['key']}_ios_{start_date}_{end_date}.csv",
+                mime="text/csv",
+            )
+
+    if "Android" in platforms:
+        st.subheader("Android")
+        show_stats("Android", android_stats, android_all)
+        if android_df.empty:
+            st.info("Seçtiğin tarih aralığında Android sürümü bulunamadı (veya tarih parse edilemedi).")
+        else:
+            st.dataframe(android_df, use_container_width=True)
+            st.download_button(
+                "Android CSV indir",
+                android_df.to_csv(index=False).encode("utf-8"),
+                file_name=f"{app_cfg['key']}_android_{start_date}_{end_date}.csv",
+                mime="text/csv",
+            )
+
+    # Combined download
+    combined = pd.concat([df for df in [ios_df, android_df] if not df.empty], ignore_index=True)
+    if not combined.empty:
+        st.divider()
+        c1, c2 = st.columns(2)
+        with c1:
+            st.download_button(
+                "Tümü CSV indir",
+                combined.to_csv(index=False).encode("utf-8"),
+                file_name=f"{app_cfg['key']}_all_{start_date}_{end_date}.csv",
+                mime="text/csv",
+            )
+        with c2:
+            import io
+            buff = io.BytesIO()
+            with pd.ExcelWriter(buff, engine="openpyxl") as writer:
+                combined.to_excel(writer, index=False, sheet_name="releases")
+            st.download_button(
+                "Tümü Excel indir",
+                buff.getvalue(),
+                file_name=f"{app_cfg['key']}_all_{start_date}_{end_date}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            )
+
 else:
     st.info("Soldan seçim yapıp **Getir**’e bas.")
