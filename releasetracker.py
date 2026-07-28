@@ -20,6 +20,16 @@ HEADERS = {
     "Accept-Language": "tr-TR,tr;q=0.9,en;q=0.8",
 }
 
+# APKPure Cloudflare arkasında; cloudscraper varsa challenge'ı geçer.
+# Kurulum:  pip install cloudscraper
+try:
+    import cloudscraper
+    _APKPURE_SCRAPER = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False}
+    )
+except Exception:
+    _APKPURE_SCRAPER = None
+
 st.set_page_config(page_title="QA Release Tracker", layout="wide")
 
 
@@ -83,6 +93,31 @@ def fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]
         except Exception as e:
             last_status = 0
             last_text = f"ERROR: {type(e).__name__}: {e}"
+            time.sleep(1.0 + attempt * 0.5)
+    return last_status, last_text
+
+
+def apkpure_fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]:
+    """APKPure Cloudflare arkasında: cloudscraper varsa onunla, yoksa düz requests ile dener."""
+    last_status, last_text = 0, ""
+    for attempt in range(retries + 1):
+        try:
+            if _APKPURE_SCRAPER is not None:
+                # cloudscraper kendi UA'sını yönetir; sadece dil başlığını geçiyoruz
+                r = _APKPURE_SCRAPER.get(
+                    url, headers={"Accept-Language": HEADERS["Accept-Language"]}, timeout=timeout
+                )
+            else:
+                r = requests.get(url, headers=HEADERS, timeout=timeout)
+            last_status, last_text = r.status_code, (r.text or "")
+            if r.status_code == 200 and last_text:
+                return last_status, last_text
+            if r.status_code in {403, 429, 500, 502, 503, 504}:
+                time.sleep(1.5 + attempt * 1.0)
+                continue
+            return last_status, last_text
+        except Exception as e:
+            last_status, last_text = 0, f"ERROR: {type(e).__name__}: {e}"
             time.sleep(1.0 + attempt * 0.5)
     return last_status, last_text
 
@@ -283,7 +318,7 @@ def fetch_ios_version_history(app_url: str) -> list[dict]:
 
 
 # ----------------------------
-# Android: APKPure versions (tam liste)
+# Android — Kaynak 1: APKPure versions (tam liste, doğru yayın tarihi)
 # ----------------------------
 APKPURE_VERSIONS_URL_BY_PACKAGE = {
     "com.turkcell.gncplay": "https://apkpure.com/fizy-%E2%80%93-music-video/com.turkcell.gncplay/versions",  # fizy
@@ -333,6 +368,7 @@ def extract_apkpure_versions(full_text: str) -> list[dict]:
             "version": version,
             "released_at": released_at,
             "notes": file_type or "APK/XAPK",
+            "source": "apkpure.com",
         })
 
     return out
@@ -343,19 +379,15 @@ def fetch_android_versions_apkpure(package_name: str) -> list[dict]:
     url = APKPURE_VERSIONS_URL_BY_PACKAGE.get(package_name)
     if not url:
         return [{
-            "platform": "Android",
-            "version": "N/A",
-            "released_at": None,
-            "notes": f"APKPure URL mapping yok: {package_name}",
+            "platform": "Android", "version": "N/A", "released_at": None,
+            "notes": f"APKPure URL mapping yok: {package_name}", "source": "apkpure.com",
         }]
 
-    status, html = fetch_text(url)
+    status, html = apkpure_fetch_text(url)
     if status != 200:
         return [{
-            "platform": "Android",
-            "version": "N/A",
-            "released_at": None,
-            "notes": f"APKPure fetch failed. HTTP {status}.",
+            "platform": "Android", "version": "N/A", "released_at": None,
+            "notes": f"APKPure fetch failed. HTTP {status}.", "source": "apkpure.com",
         }]
 
     soup = BeautifulSoup(html, "html.parser")
@@ -365,13 +397,103 @@ def fetch_android_versions_apkpure(package_name: str) -> list[dict]:
     if not items:
         snippet = clean_text(text, 500)
         return [{
-            "platform": "Android",
-            "version": "N/A",
-            "released_at": None,
-            "notes": f"APKPure parse edilemedi. Snippet: {snippet}",
+            "platform": "Android", "version": "N/A", "released_at": None,
+            "notes": f"APKPure parse edilemedi. Snippet: {snippet}", "source": "apkpure.com",
         }]
 
     return items
+
+
+# ----------------------------
+# Android — Kaynak 2 (fallback): Aptoide JSON API
+# Not: Cloudflare yok, ama tarih = uygulamanın ilgili Aptoide store'a YÜKLENME tarihi,
+# resmi Google Play yayın tarihi değil. Yalnızca APKPure engellenirse devreye girer.
+# ----------------------------
+APTOIDE_HOSTS = ["https://ws75.aptoide.com", "https://ws2.aptoide.com"]
+
+
+def _aptoide_parse_date(s: str) -> date | None:
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").date()
+    except Exception:
+        try:
+            return dtparser.parse(s).date()
+        except Exception:
+            return None
+
+
+def _aptoide_candidate_urls(pkg: str) -> list[str]:
+    forms = [
+        f"listAppVersions/package_name={pkg}/limit=100",
+        f"listAppVersions/package={pkg}/limit=100",
+        f"listAppVersions/apps_package={pkg}/limit=100",
+    ]
+    return [f"{h}/api/7/{p}" for h in APTOIDE_HOSTS for p in forms]
+
+
+@st.cache_data(ttl=60 * 30)
+def fetch_android_versions_aptoide(package_name: str) -> list[dict]:
+    last_err = ""
+    for url in _aptoide_candidate_urls(package_name):
+        try:
+            r = requests.get(
+                url, headers={"Accept-Language": HEADERS["Accept-Language"]}, timeout=25
+            )
+            if r.status_code != 200:
+                last_err = f"HTTP {r.status_code}"
+                continue
+            data = r.json()
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            continue
+
+        # yanıt zarfı endpoint sürümüne göre değişebilir; olası anahtarları sırayla dene
+        lst = None
+        if isinstance(data, dict):
+            lst = (data.get("datalist") or {}).get("list") or data.get("list")
+        if not lst:
+            last_err = "beklenmeyen yanıt zarfı"
+            continue
+
+        out, seen = [], set()
+        for it in lst:
+            f = (it or {}).get("file") or {}
+            version = str(f.get("vername") or it.get("vername") or "").strip()
+            if not version:
+                continue
+            released_at = _aptoide_parse_date(
+                it.get("updated") or it.get("added") or f.get("added")
+            )
+            key = (version, released_at)
+            if key in seen:
+                continue
+            seen.add(key)
+            out.append({
+                "platform": "Android",
+                "version": version,
+                "released_at": released_at,
+                "notes": "Aptoide (yükleme tarihi)",
+                "source": "aptoide.com",
+            })
+        if out:
+            return out
+
+    return [{
+        "platform": "Android", "version": "N/A", "released_at": None,
+        "notes": f"Aptoide fallback başarısız: {last_err}", "source": "aptoide.com",
+    }]
+
+
+def fetch_android_versions(package_name: str) -> list[dict]:
+    """Önce APKPure (doğru tarih). Engellenirse (ör. Cloudflare 403) Aptoide API'sine düş."""
+    items = fetch_android_versions_apkpure(package_name)
+    ok = [it for it in items if it.get("version") not in (None, "", "N/A")]
+    if ok:
+        return items
+    return fetch_android_versions_aptoide(package_name)
 
 
 # ----------------------------
@@ -435,7 +557,7 @@ if run:
     android_df = pd.DataFrame()
     if "Android" in platforms:
         with st.spinner("Android sürüm geçmişi çekiliyor..."):
-            android_all = fetch_android_versions_apkpure(app_cfg["android_package"])
+            android_all = fetch_android_versions(app_cfg["android_package"])
         android_in_range = filter_in_range(android_all, start_date, end_date)
 
         if android_all and android_all[0].get("version") == "N/A":
@@ -449,7 +571,7 @@ if run:
                 "Release Date": it["released_at"],
                 "Age": "",
                 "Notes": it.get("notes", ""),
-                "Source": "apkpure.com",
+                "Source": it.get("source", "apkpure.com"),
             } for it in android_in_range])
             android_df = add_iso_week(android_df)
             android_df = dedupe_and_sort(android_df)
