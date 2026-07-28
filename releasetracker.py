@@ -30,6 +30,13 @@ try:
 except Exception:
     _APKPURE_SCRAPER = None
 
+# Google Play kaynağı (güvenilir; yalnızca GÜNCEL sürüm)
+# Kurulum:  pip install google-play-scraper
+try:
+    from google_play_scraper import app as _gp_app
+except Exception:
+    _gp_app = None
+
 st.set_page_config(page_title="QA Release Tracker", layout="wide")
 
 
@@ -405,95 +412,60 @@ def fetch_android_versions_apkpure(package_name: str) -> list[dict]:
 
 
 # ----------------------------
-# Android — Kaynak 2 (fallback): Aptoide JSON API
-# Not: Cloudflare yok, ama tarih = uygulamanın ilgili Aptoide store'a YÜKLENME tarihi,
-# resmi Google Play yayın tarihi değil. Yalnızca APKPure engellenirse devreye girer.
+# Android — Kaynak 2: Google Play (güvenilir varsayılan, yalnızca GÜNCEL sürüm)
+# Not: Google Play geçmiş sürüm listesini herkese açmaz; app() yalnızca güncel
+# sürümü + doğru güncelleme tarihini + sürüm notunu verir. Cloudflare yok.
 # ----------------------------
-APTOIDE_HOSTS = ["https://ws75.aptoide.com", "https://ws2.aptoide.com"]
-
-
-def _aptoide_parse_date(s: str) -> date | None:
-    s = (s or "").strip()
-    if not s:
-        return None
-    try:
-        return datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").date()
-    except Exception:
-        try:
-            return dtparser.parse(s).date()
-        except Exception:
-            return None
-
-
-def _aptoide_candidate_urls(pkg: str) -> list[str]:
-    forms = [
-        f"listAppVersions/package_name={pkg}/limit=100",
-        f"listAppVersions/package={pkg}/limit=100",
-        f"listAppVersions/apps_package={pkg}/limit=100",
-    ]
-    return [f"{h}/api/7/{p}" for h in APTOIDE_HOSTS for p in forms]
-
-
 @st.cache_data(ttl=60 * 30)
-def fetch_android_versions_aptoide(package_name: str) -> list[dict]:
-    last_err = ""
-    for url in _aptoide_candidate_urls(package_name):
+def fetch_android_versions_googleplay(package_name: str) -> list[dict]:
+    if _gp_app is None:
+        return [{
+            "platform": "Android", "version": "N/A", "released_at": None,
+            "notes": "google-play-scraper kurulu değil (pip install google-play-scraper)",
+            "source": "play.google.com",
+        }]
+    try:
+        info = _gp_app(package_name, lang="tr", country="tr")
+    except Exception as e:
+        return [{
+            "platform": "Android", "version": "N/A", "released_at": None,
+            "notes": f"Google Play fetch failed: {type(e).__name__}: {e}",
+            "source": "play.google.com",
+        }]
+
+    version = str(info.get("version") or "").strip()
+    if version.lower() in {"", "varies with device"}:
+        version = version or "N/A"
+
+    released_at = None
+    updated = info.get("updated")  # epoch (saniye)
+    if isinstance(updated, (int, float)):
         try:
-            r = requests.get(
-                url, headers={"Accept-Language": HEADERS["Accept-Language"]}, timeout=25
-            )
-            if r.status_code != 200:
-                last_err = f"HTTP {r.status_code}"
-                continue
-            data = r.json()
-        except Exception as e:
-            last_err = f"{type(e).__name__}: {e}"
-            continue
-
-        # yanıt zarfı endpoint sürümüne göre değişebilir; olası anahtarları sırayla dene
-        lst = None
-        if isinstance(data, dict):
-            lst = (data.get("datalist") or {}).get("list") or data.get("list")
-        if not lst:
-            last_err = "beklenmeyen yanıt zarfı"
-            continue
-
-        out, seen = [], set()
-        for it in lst:
-            f = (it or {}).get("file") or {}
-            version = str(f.get("vername") or it.get("vername") or "").strip()
-            if not version:
-                continue
-            released_at = _aptoide_parse_date(
-                it.get("updated") or it.get("added") or f.get("added")
-            )
-            key = (version, released_at)
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append({
-                "platform": "Android",
-                "version": version,
-                "released_at": released_at,
-                "notes": "Aptoide (yükleme tarihi)",
-                "source": "aptoide.com",
-            })
-        if out:
-            return out
+            released_at = datetime.fromtimestamp(updated).date()
+        except Exception:
+            released_at = None
 
     return [{
-        "platform": "Android", "version": "N/A", "released_at": None,
-        "notes": f"Aptoide fallback başarısız: {last_err}", "source": "aptoide.com",
+        "platform": "Android",
+        "version": version or "N/A",
+        "released_at": released_at,
+        "notes": clean_text(info.get("recentChanges") or ""),
+        "source": "play.google.com",
     }]
 
 
-def fetch_android_versions(package_name: str) -> list[dict]:
-    """Önce APKPure (doğru tarih). Engellenirse (ör. Cloudflare 403) Aptoide API'sine düş."""
-    items = fetch_android_versions_apkpure(package_name)
-    ok = [it for it in items if it.get("version") not in (None, "", "N/A")]
-    if ok:
-        return items
-    return fetch_android_versions_aptoide(package_name)
+def fetch_android_versions(package_name: str, try_apkpure_history: bool = False) -> list[dict]:
+    """
+    Güvenilir varsayılan: Google Play (yalnızca güncel sürüm, doğru tarih).
+    try_apkpure_history=True ise önce APKPure tam geçmişi denenir; ağ Cloudflare'e
+    izin vermezse (ör. 403) otomatik olarak Google Play'e düşer.
+    """
+    if try_apkpure_history:
+        items = fetch_android_versions_apkpure(package_name)
+        ok = [it for it in items if it.get("version") not in (None, "", "N/A")]
+        if ok:
+            return items
+    return fetch_android_versions_googleplay(package_name)
 
 
 # ----------------------------
@@ -511,6 +483,13 @@ with st.sidebar:
     app_cfg = next(a for a in apps if a["name"] == app_name)
 
     platforms = st.multiselect("Platform", ["iOS", "Android"], default=["iOS", "Android"])
+
+    apkpure_history = st.checkbox(
+        "Android: APKPure tam geçmişini de dene",
+        value=False,
+        help="Kapalı: Android verisi Google Play'den gelir — yalnızca GÜNCEL sürüm ama doğru tarih. "
+             "Açık: önce APKPure tam geçmişi denenir; ağ Cloudflare'e takılırsa otomatik Google Play'e düşer.",
+    )
 
     mode = st.radio("Tarih filtresi", ["Tarih aralığı", "Son X"], horizontal=True)
     if mode == "Tarih aralığı":
@@ -557,7 +536,7 @@ if run:
     android_df = pd.DataFrame()
     if "Android" in platforms:
         with st.spinner("Android sürüm geçmişi çekiliyor..."):
-            android_all = fetch_android_versions(app_cfg["android_package"])
+            android_all = fetch_android_versions(app_cfg["android_package"], try_apkpure_history=apkpure_history)
         android_in_range = filter_in_range(android_all, start_date, end_date)
 
         if android_all and android_all[0].get("version") == "N/A":
