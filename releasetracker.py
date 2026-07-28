@@ -505,21 +505,12 @@ apps = load_apps_config(APP_CONFIG_PATH)
 st.title("QA Release Tracker")
 st.caption("")
 
-# --- GEÇİCİ TANILAMA 2 (ciktiyi gonderdikten sonra sil) ---
-with st.expander("🔧 get_text yapisi", expanded=True):
-    _u = "https://turkcell-gncplay.en.uptodown.com/android/versions"
-    _st, _html = scraper_fetch_text(_u)
-    _soup = BeautifulSoup(_html or "", "html.parser")
-    _txt = re.sub(r"\s+", " ", _soup.get_text(" "))
-    _ctx = [_txt[max(0, mm.start() - 70): mm.start() + 45]
-            for mm in re.finditer(r"[Aa]ndroid\s*\+", _txt)][:6]
-    st.write("HTTP:", _st, "| get_text uzunlugu:", len(_txt))
-    st.write("Android+ baglamlari (her surum satirinin metni):")
-    for c in _ctx:
-        st.code(c)
-
 with st.sidebar:
     st.header("Seçimler")
+
+    if st.button("🔄 Önbelleği temizle"):
+        st.cache_data.clear()
+        st.rerun()
 
     app_name = st.selectbox("Uygulama", [a["name"] for a in apps])
     app_cfg = next(a for a in apps if a["name"] == app_name)
