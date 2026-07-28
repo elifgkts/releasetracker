@@ -8,6 +8,8 @@ from bs4 import BeautifulSoup
 from datetime import date, timedelta, datetime
 from dateutil.relativedelta import relativedelta
 from dateutil import parser as dtparser
+import os
+from urllib.parse import urlencode
 
 APP_CONFIG_PATH = "apps.yaml"
 
@@ -107,12 +109,35 @@ def fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]
     return last_status, last_text
 
 
-def scraper_fetch_text(url: str, timeout: int = 25, retries: int = 2) -> tuple[int, str]:
-    """Mirror'lar için: cloudscraper varsa onunla, yoksa düz requests ile dener."""
+def _proxy_wrap(url: str) -> str | None:
+    """SCRAPERAPI_KEY varsa isteği residential IP üzerinden geçirir (datacenter engelini aşar)."""
+    key = None
+    try:
+        key = st.secrets.get("SCRAPERAPI_KEY")
+    except Exception:
+        key = None
+    if not key:
+        key = os.environ.get("SCRAPERAPI_KEY")
+    if not key:
+        return None
+    return "https://api.scraperapi.com/?" + urlencode(
+        {"api_key": key, "url": url, "country_code": "tr"}
+    )
+
+
+def scraper_fetch_text(url: str, timeout: int = 60, retries: int = 2) -> tuple[int, str]:
+    """
+    Mirror'lar (Uptodown vb.) datacenter IP'lerini engelliyor.
+    - SCRAPERAPI_KEY tanimliysa istek residential proxy uzerinden gider -> Streamlit Cloud'da calisir.
+    - Yoksa cloudscraper / requests ile dogrudan denenir -> lokalde calisir.
+    """
+    proxied = _proxy_wrap(url)
     last_status, last_text = 0, ""
     for attempt in range(retries + 1):
         try:
-            if _SCRAPER is not None:
+            if proxied:
+                r = requests.get(proxied, timeout=timeout)
+            elif _SCRAPER is not None:
                 r = _SCRAPER.get(
                     url, headers={"Accept-Language": HEADERS["Accept-Language"]}, timeout=timeout
                 )
