@@ -124,7 +124,7 @@ def _proxy_wrap(url: str) -> str | None:
     if not key:
         return None
     return "https://api.scraperapi.com/?" + urlencode(
-        {"api_key": key, "url": url, "country_code": "tr"}
+        {"api_key": key, "url": url}
     )
 
 
@@ -504,6 +504,20 @@ apps = load_apps_config(APP_CONFIG_PATH)
 
 st.title("QA Release Tracker")
 st.caption("")
+
+# --- GEÇİCİ TANILAMA (calisinca bu blogu sil) ---
+with st.expander("🔧 Android kaynak tanilama", expanded=True):
+    _u = "https://turkcell-gncplay.en.uptodown.com/android/versions"
+    _st, _html = scraper_fetch_text(_u)
+    st.write("HTTP:", _st, "| uzunluk:", len(_html or ""))
+    st.write("'apk ' iceriyor mu:", ("apk " in (_html or "")))
+    try:
+        _items = extract_uptodown_versions(_html or "")
+        st.write("parse edilen surum sayisi:", len(_items))
+        st.write(_items[:3])
+    except Exception as e:
+        st.write("parse hata:", repr(e))
+    st.code((_html or "")[:600])
 
 with st.sidebar:
     st.header("Seçimler")
