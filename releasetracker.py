@@ -283,70 +283,45 @@ def fetch_ios_version_history(app_url: str) -> list[dict]:
 
 
 # ----------------------------
-# Android: Uptodown versions (tam liste)
+# Android: APKPure versions (tam liste)
 # ----------------------------
-UPTODOWN_VERSIONS_URL_BY_PACKAGE = {
-    "com.turkcell.gncplay": "https://turkcell-gncplay.en.uptodown.com/android/versions",  # fizy
-    "com.turkcell.bip": "https://bip.en.uptodown.com/android/versions",                   # BiP
-    "tr.com.turkcell.akillidepo": "https://akll-depo.en.uptodown.com/android/versions",   # lifebox
-    "com.turkcell.ott": "https://turkcell-tv.en.uptodown.com/android/versions",           # TV+
+APKPURE_VERSIONS_URL_BY_PACKAGE = {
+    "com.turkcell.gncplay": "https://apkpure.com/fizy-%E2%80%93-music-video/com.turkcell.gncplay/versions",  # fizy
+    "com.turkcell.bip": "https://apkpure.com/bip-messenger-video-call/com.turkcell.bip/versions",             # BiP
+    "tr.com.turkcell.akillidepo": "https://apkpure.com/lifebox/tr.com.turkcell.akillidepo/versions",          # lifebox
+    "com.turkcell.ott": "https://apkpure.com/tv/com.turkcell.ott/versions",                                   # TV+
 }
 
-TR_MONTHS = {
-    "oca": 1, "ocak": 1,
-    "şub": 2, "sub": 2, "şubat": 2, "subat": 2,
-    "mar": 3, "mart": 3,
-    "nis": 4, "nisan": 4,
-    "may": 5, "mayıs": 5, "mayis": 5,
-    "haz": 6, "haziran": 6,
-    "tem": 7, "temmuz": 7,
-    "ağu": 8, "agu": 8, "ağustos": 8, "agustos": 8,
-    "eyl": 9, "eylül": 9, "eylul": 9,
-    "eki": 10, "ekim": 10,
-    "kas": 11, "kasım": 11, "kasim": 11,
-    "ara": 12, "aralık": 12, "aralik": 12,
-}
+APKPURE_VER = r"\d+(?:\.\d+){0,3}(?:-[A-Za-z0-9]+)?"
+APKPURE_DATE = r"[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}"
+APKPURE_ROW = re.compile(
+    rf"\b({APKPURE_VER})\b"
+    rf"(?:\s+This is the latest version\s+Latest)?"
+    rf"\s+((?:X?APK\s*)*)[\d.]+\s*MB\s+({APKPURE_DATE})",
+    re.IGNORECASE,
+)
 
-def parse_uptodown_date(date_str: str) -> date | None:
+
+def parse_apkpure_date(date_str: str) -> date | None:
     s = (date_str or "").strip()
     if not s:
         return None
     try:
-        return dtparser.parse(s, dayfirst=True).date()
+        # APKPure İngilizce tarih: "Jun 25, 2026" — dateutil locale'den bağımsız parse eder
+        return dtparser.parse(s).date()
     except Exception:
-        pass
-    m = re.match(r"^(\d{1,2})\s+([A-Za-zÇĞİÖŞÜçğıöşü\.]+)\s+(\d{4})$", s)
-    if m:
-        day = int(m.group(1))
-        mon_raw = m.group(2).strip().lower().replace(".", "")
-        year = int(m.group(3))
-        mon = TR_MONTHS.get(mon_raw)
-        if mon:
-            try:
-                return date(year, mon, day)
-            except Exception:
-                return None
-    return None
+        return None
 
 
-def extract_uptodown_versions(full_text: str) -> list[dict]:
-    t = (full_text or "").replace("\xa0", " ")
-    t = re.sub(r"\s+", " ", t).strip()
-
-    date_pat = r"(?:[A-Za-z]{3,9}\s+\d{1,2},\s+\d{4}|\d{1,2}\s+[A-Za-zÇĞİÖŞÜçğıöşü\.]+\s+\d{4})"
-    pat = re.compile(
-        rf"\b(apk|xapk)\s+([0-9A-Za-z.\-_]+)\s+Android\s*\+\s*([0-9.]+)\s+({date_pat})\b",
-        re.IGNORECASE
-    )
+def extract_apkpure_versions(full_text: str) -> list[dict]:
+    t = re.sub(r"\s+", " ", (full_text or "").replace("\xa0", " ")).strip()
 
     out = []
     seen = set()
-
-    for m in pat.finditer(t):
-        file_type = m.group(1).lower()
-        version = m.group(2).strip()
-        date_str = m.group(4).strip()
-        released_at = parse_uptodown_date(date_str)
+    for m in APKPURE_ROW.finditer(t):
+        version = m.group(1).strip()
+        file_type = re.sub(r"\s+", " ", m.group(2).strip()).upper()
+        released_at = parse_apkpure_date(m.group(3).strip())
 
         key = (version, released_at)
         if key in seen:
@@ -357,21 +332,21 @@ def extract_uptodown_versions(full_text: str) -> list[dict]:
             "platform": "Android",
             "version": version,
             "released_at": released_at,
-            "notes": file_type.upper(),
+            "notes": file_type or "APK/XAPK",
         })
 
     return out
 
 
 @st.cache_data(ttl=60 * 30)
-def fetch_android_versions_uptodown(package_name: str) -> list[dict]:
-    url = UPTODOWN_VERSIONS_URL_BY_PACKAGE.get(package_name)
+def fetch_android_versions_apkpure(package_name: str) -> list[dict]:
+    url = APKPURE_VERSIONS_URL_BY_PACKAGE.get(package_name)
     if not url:
         return [{
             "platform": "Android",
             "version": "N/A",
             "released_at": None,
-            "notes": f"Uptodown URL mapping yok: {package_name}",
+            "notes": f"APKPure URL mapping yok: {package_name}",
         }]
 
     status, html = fetch_text(url)
@@ -380,20 +355,20 @@ def fetch_android_versions_uptodown(package_name: str) -> list[dict]:
             "platform": "Android",
             "version": "N/A",
             "released_at": None,
-            "notes": f"Uptodown fetch failed. HTTP {status}.",
+            "notes": f"APKPure fetch failed. HTTP {status}.",
         }]
 
     soup = BeautifulSoup(html, "html.parser")
     text = soup.get_text("\n")
 
-    items = extract_uptodown_versions(text)
+    items = extract_apkpure_versions(text)
     if not items:
         snippet = clean_text(text, 500)
         return [{
             "platform": "Android",
             "version": "N/A",
             "released_at": None,
-            "notes": f"Uptodown parse edilemedi. Snippet: {snippet}",
+            "notes": f"APKPure parse edilemedi. Snippet: {snippet}",
         }]
 
     return items
@@ -460,7 +435,7 @@ if run:
     android_df = pd.DataFrame()
     if "Android" in platforms:
         with st.spinner("Android sürüm geçmişi çekiliyor..."):
-            android_all = fetch_android_versions_uptodown(app_cfg["android_package"])
+            android_all = fetch_android_versions_apkpure(app_cfg["android_package"])
         android_in_range = filter_in_range(android_all, start_date, end_date)
 
         if android_all and android_all[0].get("version") == "N/A":
@@ -474,7 +449,7 @@ if run:
                 "Release Date": it["released_at"],
                 "Age": "",
                 "Notes": it.get("notes", ""),
-                "Source": "uptodown.com",
+                "Source": "apkpure.com",
             } for it in android_in_range])
             android_df = add_iso_week(android_df)
             android_df = dedupe_and_sort(android_df)
