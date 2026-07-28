@@ -43,6 +43,32 @@ except Exception:
 
 st.set_page_config(page_title="QA Release Tracker", layout="wide")
 
+# --- GEÇİCİ TANILAMA (sorunu bulunca bu bloğu sil) ---
+with st.expander("🔧 Android kaynak tanılama", expanded=True):
+    _key = None
+    try:
+        _key = st.secrets.get("SCRAPERAPI_KEY")
+    except Exception:
+        _key = None
+    if not _key:
+        _key = os.environ.get("SCRAPERAPI_KEY")
+    st.write("SCRAPERAPI_KEY bulundu mu:", bool(_key))
+
+    _u = "https://turkcell-gncplay.en.uptodown.com/android/versions"
+    if _key:
+        _pu = "https://api.scraperapi.com/?" + urlencode(
+            {"api_key": _key, "url": _u, "country_code": "tr"}
+        )
+        try:
+            _r = requests.get(_pu, timeout=90)
+            st.write("ScraperAPI HTTP:", _r.status_code)
+            st.write("Icerikte 'apk' geciyor mu:", ("apk " in (_r.text or "")))
+            st.code((_r.text or "")[:800])
+        except Exception as e:
+            st.write("Istek hatasi:", repr(e))
+    else:
+        st.write("Anahtar okunamadi - Secrets'a dogru formatta eklenmemis olabilir.")
+
 
 # ----------------------------
 # Utilities
